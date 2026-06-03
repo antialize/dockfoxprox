@@ -763,6 +763,9 @@ async fn post_blob_upload(
             content: Bytes::from(body),
             media_type,
             last_accessed: AtomicU64::new(now),
+            id: state
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         });
         state.insert_blob(got.clone(), blob);
         info!(%name, digest = %got, "blob stored (single-shot)");
@@ -887,6 +890,9 @@ async fn put_blob_upload(
         content: Bytes::from(buf),
         media_type: "application/octet-stream".to_string(),
         last_accessed: AtomicU64::new(now),
+        id: state
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
     state.insert_blob(got.clone(), blob);
     info!(%name, %uuid, digest = %got, bytes = size, "blob stored (resumable)");
@@ -961,14 +967,17 @@ async fn get_head_blob(
                 return Ok(serve_blob_bytes(content.clone(), media_type, &d, head));
             }
             Blob::OnDisk {
-                size, media_type, ..
+                size,
+                media_type,
+                id,
+                ..
             } => {
                 state
                     .metrics
                     .docker_blob_cache_hit_disk
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 debug!(digest = %d, "blob cache hit (disk)");
-                return serve_disk_blob(state, &d, *size, media_type.clone(), head).await;
+                return serve_disk_blob(state, &d, *id, *size, media_type.clone(), head).await;
             }
         }
     }
@@ -1187,6 +1196,9 @@ fn spawn_blob_fill(
                 content: Bytes::from(buf),
                 media_type,
                 last_accessed: AtomicU64::new(now),
+                id: state
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             }),
         );
     });
@@ -1198,6 +1210,7 @@ fn spawn_blob_fill(
 async fn serve_disk_blob(
     state: &'static State,
     digest: &Digest,
+    id: u64,
     size: u64,
     media_type: String,
     head: bool,
@@ -1212,7 +1225,7 @@ async fn serve_disk_blob(
         return Ok(builder.body(empty()).expect("build blob HEAD response"));
     }
 
-    let path = state.blob_path(digest);
+    let path = state.cache_path(id);
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(e) => {

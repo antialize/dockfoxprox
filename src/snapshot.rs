@@ -31,7 +31,7 @@ use crate::state::{Blob, Manifest, RedisEntry, State};
 
 /// Bump this when the snapshot schema changes in a way that can't be handled
 /// by serde's `#[serde(default)]` forward-compatibility.
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
 
 const SNAPSHOT_FILENAME: &str = "snapshot.cbor";
 const SNAPSHOT_TMP: &str = "snapshot.cbor.tmp";
@@ -47,6 +47,8 @@ struct Snapshot {
     blobs: Vec<BlobEntry>,
     #[serde(default)]
     redis_entries: Vec<RedisEntryEntry>,
+    #[serde(default)]
+    next_id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -72,6 +74,7 @@ struct BlobEntry {
     media_type: String,
     size: u64,
     last_accessed: u64,
+    id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -102,21 +105,23 @@ pub async fn save(state: &State) -> Result<()> {
     for entry in state.blobs.iter() {
         let digest = entry.key().clone();
         let blob = entry.value().clone();
-        let (size, media_type, last_accessed) = match blob.as_ref() {
+        let (size, media_type, last_accessed, id) = match blob.as_ref() {
             Blob::OnDisk {
                 size,
                 media_type,
                 last_accessed,
-            } => (*size, media_type.clone(), last_accessed.load(Relaxed)),
+                id,
+            } => (*size, media_type.clone(), last_accessed.load(Relaxed), *id),
             Blob::InMemory {
                 content,
                 media_type,
                 last_accessed,
+                id,
             } => {
                 // Make sure the bytes survive across restart by writing them
                 // out. This reuses the same on-disk layout as the eviction
                 // tier.
-                let path = state.blob_path(&digest);
+                let path = state.cache_path(*id);
                 if let Some(parent) = path.parent() {
                     tokio::fs::create_dir_all(parent)
                         .await
@@ -130,6 +135,7 @@ pub async fn save(state: &State) -> Result<()> {
                     content.len() as u64,
                     media_type.clone(),
                     last_accessed.load(Relaxed),
+                    *id,
                 )
             }
         };
@@ -138,6 +144,7 @@ pub async fn save(state: &State) -> Result<()> {
             media_type,
             size,
             last_accessed,
+            id,
         });
     }
 
@@ -178,6 +185,7 @@ pub async fn save(state: &State) -> Result<()> {
         manifests,
         blobs: blob_entries,
         redis_entries,
+        next_id: state.next_id.load(Relaxed),
     };
 
     let path = snapshot_path(state);
@@ -309,7 +317,7 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
             continue;
         };
         // Verify the backing file exists; otherwise the metadata is a lie.
-        let path = state.blob_path(&d);
+        let path = state.cache_path(b.id);
         let on_disk = tokio::fs::metadata(&path).await.ok();
         match on_disk {
             Some(meta) if meta.len() == b.size => {
@@ -320,6 +328,7 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
                         size: b.size,
                         media_type: b.media_type,
                         last_accessed: AtomicU64::new(b.last_accessed),
+                        id: b.id,
                     }),
                 );
                 stats.blobs += 1;
@@ -352,6 +361,7 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
 
     state.approx_memory_usage.store(memory_usage, Relaxed);
     state.disk_usage.store(disk_usage, Relaxed);
+    state.next_id.store(snap.next_id, Relaxed);
     Ok(stats)
 }
 
@@ -369,4 +379,5 @@ async fn wipe_cache(state: &State) {
     state.redis_entries.clear();
     state.approx_memory_usage.store(0, Relaxed);
     state.disk_usage.store(0, Relaxed);
+    state.next_id.store(0, Relaxed);
 }

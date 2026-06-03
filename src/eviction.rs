@@ -53,12 +53,8 @@ fn referenced_digests(content: &Bytes) -> Vec<Digest> {
 
 /// Write a blob's bytes to its canonical on-disk path, creating the shard
 /// directory if needed. Returns the path written.
-async fn write_blob_to_disk(
-    state: &State,
-    digest: &Digest,
-    content: &Bytes,
-) -> std::io::Result<PathBuf> {
-    let path = state.blob_path(digest);
+async fn write_blob_to_disk(state: &State, id: u64, content: &Bytes) -> std::io::Result<PathBuf> {
+    let path = state.cache_path(id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -68,12 +64,12 @@ async fn write_blob_to_disk(
 
 /// Remove a blob's on-disk file. NotFound is silently ignored; other errors
 /// are logged but not propagated.
-async fn delete_disk_blob(state: &State, digest: &Digest) {
-    let path = state.blob_path(digest);
+async fn delete_disk_blob(state: &State, id: u64) {
+    let path = state.cache_path(id);
     if let Err(e) = tokio::fs::remove_file(&path).await
         && e.kind() != std::io::ErrorKind::NotFound
     {
-        warn!(%digest, error=%e, path=%path.display(), "failed to remove on-disk blob");
+        warn!(%id, error=%e, path=%path.display(), "failed to remove on-disk blob");
     }
 }
 
@@ -203,9 +199,9 @@ async fn evict(state: &'static State) {
                         Blob::InMemory { content, .. } => {
                             memory_usage = memory_usage.saturating_sub(content.len() as u64);
                         }
-                        Blob::OnDisk { size, .. } => {
+                        Blob::OnDisk { size, id, .. } => {
                             disk_usage = disk_usage.saturating_sub(*size);
-                            delete_disk_blob(state, &r).await;
+                            delete_disk_blob(state, *id).await;
                         }
                     }
                 }
@@ -267,11 +263,12 @@ async fn evict(state: &'static State) {
                 content,
                 media_type,
                 last_accessed,
+                id,
             } = cur.as_ref()
             else {
                 continue;
             };
-            let path = match write_blob_to_disk(state, &r, content).await {
+            let path = match write_blob_to_disk(state, *id, content).await {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(digest=%r, error=%e, "failed to write blob to disk; keeping in memory");
@@ -282,6 +279,7 @@ async fn evict(state: &'static State) {
                 size: *size,
                 media_type: media_type.clone(),
                 last_accessed: AtomicU64::new(last_accessed.load(Relaxed)),
+                id: *id,
             });
             state.blobs.insert(r.clone(), on_disk);
             state.metrics.eviction_blobs_to_disk.fetch_add(1, Relaxed);
@@ -314,9 +312,9 @@ async fn evict(state: &'static State) {
                 Blob::InMemory { content, .. } => {
                     memory_usage = memory_usage.saturating_sub(content.len() as u64);
                 }
-                Blob::OnDisk { size, .. } => {
+                Blob::OnDisk { size, id, .. } => {
                     disk_usage = disk_usage.saturating_sub(*size);
-                    delete_disk_blob(state, digest).await;
+                    delete_disk_blob(state, *id).await;
                 }
             }
         }

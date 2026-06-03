@@ -34,12 +34,14 @@ pub struct Manifest {
 pub enum Blob {
     /// On-disk blob metadata. We don't want to keep the whole blob content in memory, but we do want to track its size and media type for eviction and content-type responses.
     OnDisk {
+        id: u64,
         size: u64,
         media_type: String,
         last_accessed: AtomicU64,
     },
     /// In-memory blob content. We keep the whole content in memory for fast access, along with its media type and last-accessed timestamp for eviction.
     InMemory {
+        id: u64,
         content: Bytes,
         media_type: String,
         last_accessed: AtomicU64,
@@ -112,6 +114,9 @@ pub struct State {
 
     /// Counters and gauges exposed at `/metrics`.
     pub metrics: Metrics,
+
+    /// Next ID to use for uploads and Redis on-disk entries.
+    pub next_id: AlignedAtomicU64,
 }
 
 /// Background task that updates `state.now` every second. Spawned by
@@ -145,6 +150,7 @@ impl State {
             disk_usage: AlignedAtomicU64::new(0),
             redis_entries: DashMap::new(),
             metrics: Metrics::default(),
+            next_id: AlignedAtomicU64::new(0),
         }));
 
         TaskBuilder::new("time updater")
@@ -171,12 +177,11 @@ impl State {
         self.manifests.insert(digest, m);
     }
 
-    /// Path on disk where the bytes of `digest` live (when evicted to disk).
-    /// Sharded by the first two hex chars to avoid huge flat directories.
-    pub fn blob_path(&self, digest: &Digest) -> PathBuf {
-        let s = digest.to_string(); // "sha256:<hex>"
-        let hex = s.strip_prefix("sha256:").unwrap_or(&s);
-        let (shard, _) = hex.split_at(2);
+    /// Path on disk where the blob with the given digest is cached.
+    /// This is where we write blobs when we evict them from memory, and where we read blobs from disk on cache hits.
+    pub fn cache_path(&self, id: u64) -> PathBuf {
+        let hex = format!("{:016x}", id);
+        let shard = &hex[14..];
         PathBuf::from(&self.config.data_folder)
             .join("blobs")
             .join(shard)
