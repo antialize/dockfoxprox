@@ -28,8 +28,8 @@ pub struct DockerRegistry {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default = "default_https_port")]
-    pub https_port: u16,
+    #[serde(default)]
+    pub https_port: Option<u16>,
 
     /// Plaintext HTTP port. Optional; intended for `/metrics` scraping by
     /// Prometheus without TLS hassle. Serves the same handler as `https_port`.
@@ -58,10 +58,6 @@ pub struct Config {
     /// Shared password required via `AUTH`. `None` disables auth.
     #[serde(default)]
     pub redis_password: Option<String>,
-}
-
-fn default_https_port() -> u16 {
-    8443
 }
 
 fn default_data_folder() -> String {

@@ -5,16 +5,13 @@ use reqwest::Client;
 use sha2::Sha256;
 use std::{
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicU64},
-    },
+    sync::{Arc, atomic::AtomicU64},
 };
 use tokio::sync::Mutex;
 use tokio_tasks::{RunToken, TaskBuilder};
 use uuid::Uuid;
 
-use crate::{config::Config, digest::Digest, metrics::Metrics};
+use crate::{aligned_atomic::AlignedAtomicU64, config::Config, digest::Digest, metrics::Metrics};
 
 /// Key for the token cache. We store tokens by registry+scope, since that's what the client sends us.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -30,28 +27,30 @@ pub struct Manifest {
     /// The media type of the manifest, e.g. "application/vnd.docker.distribution.manifest.v2+json".
     pub media_type: String,
     /// Last-used timestamp, as seconds since the Unix epoch. Updated on every access, used for LRU eviction.
-    pub last_used: AtomicI64,
+    pub last_used: AtomicU64,
 }
 
 /// Blob content or on-disk metadata, plus last-used timestamp for LRU eviction.
 pub enum Blob {
     /// On-disk blob metadata. We don't want to keep the whole blob content in memory, but we do want to track its size and media type for eviction and content-type responses.
     OnDisk {
+        id: u64,
         size: u64,
         media_type: String,
-        last_accessed: AtomicI64,
+        last_accessed: AtomicU64,
     },
     /// In-memory blob content. We keep the whole content in memory for fast access, along with its media type and last-accessed timestamp for eviction.
     InMemory {
+        id: u64,
         content: Bytes,
         media_type: String,
-        last_accessed: AtomicI64,
+        last_accessed: AtomicU64,
     },
 }
 
 impl Blob {
     /// Get the last-accessed timestamp for this blob, for eviction purposes.
-    pub fn last_accessed(&self) -> &AtomicI64 {
+    pub fn last_accessed(&self) -> &AtomicU64 {
         match self {
             Blob::InMemory { last_accessed, .. } | Blob::OnDisk { last_accessed, .. } => {
                 last_accessed
@@ -61,9 +60,17 @@ impl Blob {
 }
 
 /// A single Redis-protocol cache entry, stored only in memory.
-pub struct RedisEntry {
-    pub value: Bytes,
-    pub last_accessed: AtomicI64,
+pub enum RedisEntry {
+    InMemory {
+        value: Bytes,
+        id: u64,
+        last_accessed: AtomicU64,
+    },
+    OnDisk {
+        size: u64,
+        id: u64,
+        last_accessed: AtomicU64,
+    },
 }
 
 /// Resumable upload state. Bytes accumulate in `buf`, hashed incrementally.
@@ -102,19 +109,22 @@ pub struct State {
     pub reqwest_client: Client,
 
     /// Current time, as seconds since the Unix epoch. Updated every second by a background task, used for eviction.
-    pub now: AtomicI64,
+    pub now: AlignedAtomicU64,
 
     /// Approximate total memory usage of in-memory blobs and manifests, for eviction purposes.
-    pub approx_memory_usage: AtomicU64,
+    pub approx_memory_usage: AlignedAtomicU64,
 
     /// Approximate total disk usage of on-disk blobs
-    pub disk_usage: AtomicU64,
+    pub disk_usage: AlignedAtomicU64,
 
     /// In-memory cache entries served via the Redis protocol (for ccache et al).
     pub redis_entries: DashMap<Bytes, Arc<RedisEntry>>,
 
     /// Counters and gauges exposed at `/metrics`.
     pub metrics: Metrics,
+
+    /// Next ID to use for uploads and Redis on-disk entries.
+    pub next_id: AlignedAtomicU64,
 }
 
 /// Background task that updates `state.now` every second. Spawned by
@@ -125,7 +135,7 @@ async fn time_updater(state: &'static State) -> Result<(), ()> {
         let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64;
+            .as_secs();
         state.now.store(time, std::sync::atomic::Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
@@ -143,11 +153,12 @@ impl State {
             uploads: DashMap::new(),
             config,
             reqwest_client,
-            now: AtomicI64::new(0),
-            approx_memory_usage: AtomicU64::new(0),
-            disk_usage: AtomicU64::new(0),
+            now: AlignedAtomicU64::new(0),
+            approx_memory_usage: AlignedAtomicU64::new(0),
+            disk_usage: AlignedAtomicU64::new(0),
             redis_entries: DashMap::new(),
             metrics: Metrics::default(),
+            next_id: AlignedAtomicU64::new(0),
         }));
 
         TaskBuilder::new("time updater")
@@ -174,12 +185,11 @@ impl State {
         self.manifests.insert(digest, m);
     }
 
-    /// Path on disk where the bytes of `digest` live (when evicted to disk).
-    /// Sharded by the first two hex chars to avoid huge flat directories.
-    pub fn blob_path(&self, digest: &Digest) -> PathBuf {
-        let s = digest.to_string(); // "sha256:<hex>"
-        let hex = s.strip_prefix("sha256:").unwrap_or(&s);
-        let (shard, _) = hex.split_at(2);
+    /// Path on disk where the blob with the given digest is cached.
+    /// This is where we write blobs when we evict them from memory, and where we read blobs from disk on cache hits.
+    pub fn cache_path(&self, id: u64) -> PathBuf {
+        let hex = format!("{:016x}", id);
+        let shard = &hex[14..];
         PathBuf::from(&self.config.data_folder)
             .join("blobs")
             .join(shard)
@@ -188,39 +198,36 @@ impl State {
 
     /// Insert or replace a Redis-protocol cache entry, adjusting the shared
     /// memory accounting by the net byte delta.
-    pub fn insert_redis(&self, key: Bytes, value: Bytes) {
+    pub fn insert_redis(&self, key: Bytes, value: Bytes) -> Arc<RedisEntry> {
         use std::sync::atomic::Ordering::Relaxed;
         let now = self.now.load(Relaxed);
         let key_len = key.len() as u64;
         let new_value_len = value.len() as u64;
-        let entry = Arc::new(RedisEntry {
+        let entry = Arc::new(RedisEntry::InMemory {
             value,
-            last_accessed: AtomicI64::new(now),
+            id: self.next_id.fetch_add(1, Relaxed),
+            last_accessed: AtomicU64::new(now),
         });
-        match self.redis_entries.insert(key, entry) {
-            Some(prev) => {
-                let old_value_len = prev.value.len() as u64;
-                if new_value_len >= old_value_len {
-                    self.approx_memory_usage
-                        .fetch_add(new_value_len - old_value_len, Relaxed);
-                } else {
-                    self.approx_memory_usage
-                        .fetch_sub(old_value_len - new_value_len, Relaxed);
-                }
-            }
-            None => {
-                self.approx_memory_usage
-                    .fetch_add(key_len + new_value_len, Relaxed);
-            }
+        self.approx_memory_usage
+            .fetch_add(new_value_len + key_len, Relaxed);
+        if let Some(v) = self.redis_entries.insert(key, entry.clone())
+            && let RedisEntry::OnDisk { id, .. } = v.as_ref()
+        {
+            let path = self.cache_path(*id);
+            // We used to have an on-disk Redis entry here, so we need to delete the file.
+            tokio::spawn(tokio::fs::remove_file(path));
         }
+        entry
     }
 
     /// Remove a Redis entry by key, returning whether it existed.
     pub fn remove_redis(&self, key: &[u8]) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        if let Some((k, v)) = self.redis_entries.remove(key) {
-            self.approx_memory_usage
-                .fetch_sub(k.len() as u64 + v.value.len() as u64, Relaxed);
+        if let Some((_, v)) = self.redis_entries.remove(key) {
+            if let RedisEntry::OnDisk { id, .. } = v.as_ref() {
+                let path = self.cache_path(*id);
+                // We used to have an on-disk Redis entry here, so we need to delete the file.
+                tokio::spawn(tokio::fs::remove_file(path));
+            }
             true
         } else {
             false
@@ -228,13 +235,20 @@ impl State {
     }
 
     /// Drop every Redis entry, reclaiming the bytes from the memory counter.
-    pub fn flush_redis(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut total: u64 = 0;
-        self.redis_entries.retain(|k, v| {
-            total += k.len() as u64 + v.value.len() as u64;
+    pub fn flush_redis(&'static self) {
+        let mut delete = Vec::new();
+        self.redis_entries.retain(|_, v| {
+            if let RedisEntry::OnDisk { id, .. } = v.as_ref() {
+                delete.push(*id);
+            }
             false
         });
-        self.approx_memory_usage.fetch_sub(total, Relaxed);
+        tokio::spawn(async move {
+            for id in delete {
+                let path = self.cache_path(id);
+                // We had an on-disk Redis entry, so we need to delete the file.
+                tokio::fs::remove_file(path).await.ok();
+            }
+        });
     }
 }

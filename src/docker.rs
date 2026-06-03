@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::AtomicU64;
 use std::task::{Context as TaskContext, Poll};
 
 use crate::config::DockerRegistry;
@@ -367,7 +367,7 @@ async fn get_head_manifest(
     let entry = Arc::new(Manifest {
         content: body,
         media_type,
-        last_used: AtomicI64::new(now),
+        last_used: AtomicU64::new(now),
     });
     state.insert_manifest(digest.clone(), entry.clone());
 
@@ -704,7 +704,7 @@ async fn put_manifest(
     let manifest = Arc::new(Manifest {
         content: Bytes::from(body),
         media_type: content_type,
-        last_used: AtomicI64::new(now),
+        last_used: AtomicU64::new(now),
     });
     let len = manifest.content.len();
     state.insert_manifest(digest.clone(), manifest);
@@ -762,7 +762,10 @@ async fn post_blob_upload(
         let blob = Arc::new(Blob::InMemory {
             content: Bytes::from(body),
             media_type,
-            last_accessed: AtomicI64::new(now),
+            last_accessed: AtomicU64::new(now),
+            id: state
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         });
         state.insert_blob(got.clone(), blob);
         info!(%name, digest = %got, "blob stored (single-shot)");
@@ -886,7 +889,10 @@ async fn put_blob_upload(
     let blob = Arc::new(Blob::InMemory {
         content: Bytes::from(buf),
         media_type: "application/octet-stream".to_string(),
-        last_accessed: AtomicI64::new(now),
+        last_accessed: AtomicU64::new(now),
+        id: state
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
     state.insert_blob(got.clone(), blob);
     info!(%name, %uuid, digest = %got, bytes = size, "blob stored (resumable)");
@@ -961,14 +967,17 @@ async fn get_head_blob(
                 return Ok(serve_blob_bytes(content.clone(), media_type, &d, head));
             }
             Blob::OnDisk {
-                size, media_type, ..
+                size,
+                media_type,
+                id,
+                ..
             } => {
                 state
                     .metrics
                     .docker_blob_cache_hit_disk
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 debug!(digest = %d, "blob cache hit (disk)");
-                return serve_disk_blob(state, &d, *size, media_type.clone(), head).await;
+                return serve_disk_blob(state, &d, *id, *size, media_type.clone(), head).await;
             }
         }
     }
@@ -1186,7 +1195,10 @@ fn spawn_blob_fill(
             Arc::new(Blob::InMemory {
                 content: Bytes::from(buf),
                 media_type,
-                last_accessed: AtomicI64::new(now),
+                last_accessed: AtomicU64::new(now),
+                id: state
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             }),
         );
     });
@@ -1198,6 +1210,7 @@ fn spawn_blob_fill(
 async fn serve_disk_blob(
     state: &'static State,
     digest: &Digest,
+    id: u64,
     size: u64,
     media_type: String,
     head: bool,
@@ -1212,7 +1225,7 @@ async fn serve_disk_blob(
         return Ok(builder.body(empty()).expect("build blob HEAD response"));
     }
 
-    let path = state.blob_path(digest);
+    let path = state.cache_path(id);
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(e) => {
