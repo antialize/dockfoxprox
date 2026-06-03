@@ -150,6 +150,7 @@ async fn handle_conn(state: &'static State, sock: TcpStream) -> io::Result<()> {
                             state.metrics.redis_get_miss.fetch_add(1, Relaxed);
                             debug!(key = %String::from_utf8_lossy(&key), "redis GET miss");
                             write_nil(&mut w).await?;
+                            w.flush().await?;
                             continue;
                         };
                         entry.value().clone()
