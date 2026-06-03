@@ -88,7 +88,15 @@ pub async fn handle_request(
         Err(e) => match e {
             DockerError::InvalidAuth => {
                 warn!(error = %e, "invalid auth");
-                return Ok(error_response(StatusCode::UNAUTHORIZED, "Unauthorized"));
+                let body = Full::new(Bytes::from_static(b"Unauthorized"))
+                    .map_err(|never| match never {})
+                    .boxed();
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .header(WWW_AUTHENTICATE, "Basic realm=\"dockfoxprox\"")
+                    .body(body)
+                    .expect("static response"));
             }
             DockerError::NotFound => {
                 warn!(error = %e, "not found");
