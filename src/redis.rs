@@ -15,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tasks::{RunToken, TaskBuilder, cancelable};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
-use crate::state::State;
+use crate::state::{RedisEntry, State};
 
 /// Accept loop for the Redis-protocol server. Each accepted connection is
 /// handed to an aborting per-connection task. Returns when `rt` is cancelled.
@@ -62,7 +62,7 @@ async fn handle_conn(state: &'static State, sock: TcpStream) -> io::Result<()> {
     let mut w = BufWriter::with_capacity(64 * 1024, w);
     let mut authed = state.config.redis_password.is_none();
 
-    while let Some(args) = read_command(&mut r).await? {
+    while let Some(mut args) = read_command(&mut r).await? {
         if args.is_empty() {
             continue;
         }
@@ -143,22 +143,51 @@ async fn handle_conn(state: &'static State, sock: TcpStream) -> io::Result<()> {
                 if args.len() != 2 {
                     write_error(&mut w, "ERR wrong number of arguments for 'get'").await?;
                 } else {
-                    let key: &[u8] = &args[1];
+                    let key = std::mem::take(&mut args[1]);
                     let now = state.now.load(Relaxed);
-                    let hit = state.redis_entries.get(key).map(|e| {
-                        e.value().last_accessed.store(now, Relaxed);
-                        e.value().value.clone()
-                    });
-                    match hit {
-                        Some(v) => {
-                            state.metrics.redis_get_hit.fetch_add(1, Relaxed);
-                            debug!(key = %String::from_utf8_lossy(key), bytes = v.len(), "redis GET hit");
-                            write_bulk(&mut w, &v).await?;
-                        }
-                        None => {
+                    let entry = {
+                        let Some(entry) = state.redis_entries.get(&key) else {
                             state.metrics.redis_get_miss.fetch_add(1, Relaxed);
-                            debug!(key = %String::from_utf8_lossy(key), "redis GET miss");
-                            w.write_all(b"$-1\r\n").await?;
+                            debug!(key = %String::from_utf8_lossy(&key), "redis GET miss");
+                            write_nil(&mut w).await?;
+                            continue;
+                        };
+                        entry.value().clone()
+                    };
+                    match entry.as_ref() {
+                        RedisEntry::InMemory {
+                            value,
+                            last_accessed,
+                            ..
+                        } => {
+                            last_accessed.store(now, Relaxed);
+                            state.metrics.redis_get_hit.fetch_add(1, Relaxed);
+                            debug!(key = %String::from_utf8_lossy(&key), bytes = value.len(), "redis GET hit");
+                            write_bulk(&mut w, value).await?;
+                        }
+                        RedisEntry::OnDisk { id, .. } => {
+                            let path = state.cache_path(*id);
+                            match tokio::fs::read(path).await {
+                                Ok(value) => {
+                                    let ent2 = state.insert_redis(key.clone(), value.into());
+                                    let RedisEntry::InMemory { value, .. } = ent2.as_ref() else {
+                                        unreachable!();
+                                    };
+                                    state.metrics.redis_get_hit.fetch_add(1, Relaxed);
+                                    debug!(key = %String::from_utf8_lossy(&key), bytes = value.len(), "redis GET hit (on disk)");
+                                    write_bulk(&mut w, value).await?;
+                                }
+                                Err(e) => {
+                                    // Drop the dangling metadata entry and try
+                                    // to remove the (possibly partial) file so
+                                    // we don't leak disk. `remove_redis` will
+                                    // schedule the unlink for the on-disk id.
+                                    state.remove_redis(&key);
+                                    state.metrics.redis_get_miss.fetch_add(1, Relaxed);
+                                    warn!(key = %String::from_utf8_lossy(&key), error = %e, "redis GET failed to read from disk");
+                                    write_nil(&mut w).await?;
+                                }
+                            }
                         }
                     }
                 }
@@ -320,4 +349,11 @@ async fn write_bulk<W: AsyncWriteExt + Unpin>(w: &mut W, b: &[u8]) -> io::Result
     w.write_all(format!("${}\r\n", b.len()).as_bytes()).await?;
     w.write_all(b).await?;
     w.write_all(b"\r\n").await
+}
+
+/// Write a RESP nil bulk string (`$-1\r\n`). Distinct from an empty bulk
+/// (`$0\r\n\r\n`); clients (e.g. ccache) rely on the difference to tell
+/// "key absent" from "key present with empty value".
+async fn write_nil<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
+    w.write_all(b"$-1\r\n").await
 }

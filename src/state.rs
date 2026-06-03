@@ -60,9 +60,17 @@ impl Blob {
 }
 
 /// A single Redis-protocol cache entry, stored only in memory.
-pub struct RedisEntry {
-    pub value: Bytes,
-    pub last_accessed: AtomicU64,
+pub enum RedisEntry {
+    InMemory {
+        value: Bytes,
+        id: u64,
+        last_accessed: AtomicU64,
+    },
+    OnDisk {
+        size: u64,
+        id: u64,
+        last_accessed: AtomicU64,
+    },
 }
 
 /// Resumable upload state. Bytes accumulate in `buf`, hashed incrementally.
@@ -190,39 +198,36 @@ impl State {
 
     /// Insert or replace a Redis-protocol cache entry, adjusting the shared
     /// memory accounting by the net byte delta.
-    pub fn insert_redis(&self, key: Bytes, value: Bytes) {
+    pub fn insert_redis(&self, key: Bytes, value: Bytes) -> Arc<RedisEntry> {
         use std::sync::atomic::Ordering::Relaxed;
         let now = self.now.load(Relaxed);
         let key_len = key.len() as u64;
         let new_value_len = value.len() as u64;
-        let entry = Arc::new(RedisEntry {
+        let entry = Arc::new(RedisEntry::InMemory {
             value,
+            id: self.next_id.fetch_add(1, Relaxed),
             last_accessed: AtomicU64::new(now),
         });
-        match self.redis_entries.insert(key, entry) {
-            Some(prev) => {
-                let old_value_len = prev.value.len() as u64;
-                if new_value_len >= old_value_len {
-                    self.approx_memory_usage
-                        .fetch_add(new_value_len - old_value_len, Relaxed);
-                } else {
-                    self.approx_memory_usage
-                        .fetch_sub(old_value_len - new_value_len, Relaxed);
-                }
-            }
-            None => {
-                self.approx_memory_usage
-                    .fetch_add(key_len + new_value_len, Relaxed);
-            }
+        self.approx_memory_usage
+            .fetch_add(new_value_len + key_len, Relaxed);
+        if let Some(v) = self.redis_entries.insert(key, entry.clone())
+            && let RedisEntry::OnDisk { id, .. } = v.as_ref()
+        {
+            let path = self.cache_path(*id);
+            // We used to have an on-disk Redis entry here, so we need to delete the file.
+            tokio::spawn(tokio::fs::remove_file(path));
         }
+        entry
     }
 
     /// Remove a Redis entry by key, returning whether it existed.
     pub fn remove_redis(&self, key: &[u8]) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        if let Some((k, v)) = self.redis_entries.remove(key) {
-            self.approx_memory_usage
-                .fetch_sub(k.len() as u64 + v.value.len() as u64, Relaxed);
+        if let Some((_, v)) = self.redis_entries.remove(key) {
+            if let RedisEntry::OnDisk { id, .. } = v.as_ref() {
+                let path = self.cache_path(*id);
+                // We used to have an on-disk Redis entry here, so we need to delete the file.
+                tokio::spawn(tokio::fs::remove_file(path));
+            }
             true
         } else {
             false
@@ -230,13 +235,20 @@ impl State {
     }
 
     /// Drop every Redis entry, reclaiming the bytes from the memory counter.
-    pub fn flush_redis(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut total: u64 = 0;
-        self.redis_entries.retain(|k, v| {
-            total += k.len() as u64 + v.value.len() as u64;
+    pub fn flush_redis(&'static self) {
+        let mut delete = Vec::new();
+        self.redis_entries.retain(|_, v| {
+            if let RedisEntry::OnDisk { id, .. } = v.as_ref() {
+                delete.push(*id);
+            }
             false
         });
-        self.approx_memory_usage.fetch_sub(total, Relaxed);
+        tokio::spawn(async move {
+            for id in delete {
+                let path = self.cache_path(id);
+                // We had an on-disk Redis entry, so we need to delete the file.
+                tokio::fs::remove_file(path).await.ok();
+            }
+        });
     }
 }

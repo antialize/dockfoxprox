@@ -36,6 +36,12 @@ const SNAPSHOT_VERSION: u32 = 2;
 const SNAPSHOT_FILENAME: &str = "snapshot.cbor";
 const SNAPSHOT_TMP: &str = "snapshot.cbor.tmp";
 
+/// Maximum size for entries we inline into the snapshot itself instead of
+/// spilling them to a separate file under `<data_folder>/blobs/`. Small
+/// entries are cheap to keep in the snapshot CBOR and avoid the per-file
+/// I/O cost on save and on startup load.
+const SNAPSHOT_INLINE_THRESHOLD: usize = 1024;
+
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     version: u32,
@@ -75,13 +81,18 @@ struct BlobEntry {
     size: u64,
     last_accessed: u64,
     id: u64,
+    // Only present for small blobs that we do not spill
+    content: Option<Bytes>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct RedisEntryEntry {
     key: Bytes,
-    value: Bytes,
+    id: u64,
+    // Only present for small entries that we do not spill
+    value: Option<Bytes>,
     last_accessed: u64,
+    size: u64,
 }
 
 fn snapshot_path(state: &State) -> PathBuf {
@@ -105,13 +116,34 @@ pub async fn save(state: &State) -> Result<()> {
     for entry in state.blobs.iter() {
         let digest = entry.key().clone();
         let blob = entry.value().clone();
-        let (size, media_type, last_accessed, id) = match blob.as_ref() {
+        let (size, media_type, last_accessed, id, content) = match blob.as_ref() {
             Blob::OnDisk {
                 size,
                 media_type,
                 last_accessed,
                 id,
-            } => (*size, media_type.clone(), last_accessed.load(Relaxed), *id),
+            } => (
+                *size,
+                media_type.clone(),
+                last_accessed.load(Relaxed),
+                *id,
+                None,
+            ),
+            Blob::InMemory {
+                id,
+                content,
+                media_type,
+                last_accessed,
+            } if content.len() <= SNAPSHOT_INLINE_THRESHOLD => {
+                // Small blobs are cheap to keep in memory, so we can avoid the overhead of spilling them out and reading them back on startup.
+                (
+                    content.len() as u64,
+                    media_type.clone(),
+                    last_accessed.load(Relaxed),
+                    *id,
+                    Some(content.clone()),
+                )
+            }
             Blob::InMemory {
                 content,
                 media_type,
@@ -136,6 +168,7 @@ pub async fn save(state: &State) -> Result<()> {
                     media_type.clone(),
                     last_accessed.load(Relaxed),
                     *id,
+                    None,
                 )
             }
         };
@@ -145,6 +178,7 @@ pub async fn save(state: &State) -> Result<()> {
             size,
             last_accessed,
             id,
+            content,
         });
     }
 
@@ -169,15 +203,71 @@ pub async fn save(state: &State) -> Result<()> {
         })
         .collect();
 
-    let redis_entries: Vec<RedisEntryEntry> = state
-        .redis_entries
-        .iter()
-        .map(|e| RedisEntryEntry {
-            key: e.key().clone(),
-            value: e.value().value.clone(),
-            last_accessed: e.value().last_accessed.load(Relaxed),
-        })
-        .collect();
+    let mut redis_entries: Vec<RedisEntryEntry> = Vec::with_capacity(state.redis_entries.len());
+    for entry in &state.redis_entries {
+        let key = entry.key().clone();
+        let entry = entry.value().as_ref();
+
+        match entry {
+            RedisEntry::InMemory {
+                value,
+                id,
+                last_accessed,
+            } if value.len() <= SNAPSHOT_INLINE_THRESHOLD => {
+                // Small entries are cheap to keep in memory, so we can avoid the overhead of spilling them out and reading them back on startup.
+                redis_entries.push(RedisEntryEntry {
+                    key,
+                    value: Some(value.clone()),
+                    last_accessed: last_accessed.load(Relaxed),
+                    id: *id,
+                    size: value.len() as u64,
+                });
+            }
+            RedisEntry::InMemory {
+                value,
+                id,
+                last_accessed,
+            } => {
+                // Make sure the bytes survive across restart by writing them
+                // out. This reuses the same on-disk layout as the eviction
+                // tier.
+                let path = state.cache_path(*id);
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .with_context(|| format!("create dir for spill {}", parent.display()))?;
+                }
+                tokio::fs::write(&path, &value).await.with_context(|| {
+                    format!(
+                        "spill redis entry {} to {}",
+                        String::from_utf8_lossy(&key),
+                        path.display()
+                    )
+                })?;
+                spilled += value.len() as u64;
+                redis_entries.push(RedisEntryEntry {
+                    key,
+                    value: None,
+                    last_accessed: last_accessed.load(Relaxed),
+                    id: *id,
+                    size: value.len() as u64,
+                });
+            }
+            RedisEntry::OnDisk {
+                size,
+                id,
+                last_accessed,
+            } => {
+                redis_entries.push(RedisEntryEntry {
+                    key,
+                    value: None,
+                    last_accessed: last_accessed.load(Relaxed),
+                    id: *id,
+                    size: *size,
+                });
+            }
+        }
+    }
 
     let snap = Snapshot {
         version: SNAPSHOT_VERSION,
@@ -316,6 +406,22 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
         let Ok(d) = b.digest.parse::<Digest>() else {
             continue;
         };
+        // Small blobs are inlined directly in the snapshot; restore them as
+        // in-memory entries without touching the disk.
+        if let Some(content) = b.content {
+            memory_usage += content.len() as u64;
+            state.blobs.insert(
+                d,
+                Arc::new(Blob::InMemory {
+                    id: b.id,
+                    content,
+                    media_type: b.media_type,
+                    last_accessed: AtomicU64::new(b.last_accessed),
+                }),
+            );
+            stats.blobs += 1;
+            continue;
+        }
         // Verify the backing file exists; otherwise the metadata is a lie.
         let path = state.cache_path(b.id);
         let on_disk = tokio::fs::metadata(&path).await.ok();
@@ -348,14 +454,27 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
     }
 
     for r in snap.redis_entries {
-        memory_usage += r.key.len() as u64 + r.value.len() as u64;
-        state.redis_entries.insert(
-            r.key,
-            Arc::new(RedisEntry {
-                value: r.value,
-                last_accessed: AtomicU64::new(r.last_accessed),
-            }),
-        );
+        if let Some(value) = r.value {
+            memory_usage += r.key.len() as u64 + value.len() as u64;
+            state.redis_entries.insert(
+                r.key,
+                Arc::new(RedisEntry::InMemory {
+                    value,
+                    id: r.id,
+                    last_accessed: AtomicU64::new(r.last_accessed),
+                }),
+            );
+        } else {
+            disk_usage += r.size;
+            state.redis_entries.insert(
+                r.key,
+                Arc::new(RedisEntry::OnDisk {
+                    id: r.id,
+                    last_accessed: AtomicU64::new(r.last_accessed),
+                    size: r.size,
+                }),
+            );
+        }
         stats.redis_entries += 1;
     }
 

@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     digest::Digest,
-    state::{Blob, State},
+    state::{Blob, RedisEntry, State},
 };
 
 /// Blobs younger than this are never deleted by eviction. Covers the
@@ -140,21 +140,41 @@ async fn evict(state: &'static State) {
         }
     }
 
-    let mut redis_entries = Vec::new();
+    let mut disk_redis_entries = Vec::new();
+    let mut memory_redis_entries = Vec::new();
     for entry in &state.redis_entries {
-        memory_usage += entry.value().value.len() as u64 + entry.key().len() as u64;
-        let last_accessed = entry.value().last_accessed.load(Relaxed);
-        redis_entries.push((
-            last_accessed,
-            entry.key().clone(),
-            entry.value().value.len() as u64 + entry.key().len() as u64,
-        ));
+        match entry.value().as_ref() {
+            RedisEntry::InMemory {
+                value,
+                last_accessed,
+                ..
+            } => {
+                memory_usage += value.len() as u64 + entry.key().len() as u64;
+                memory_redis_entries.push((
+                    last_accessed.load(Relaxed),
+                    entry.key().clone(),
+                    value.len() as u64,
+                ));
+            }
+            RedisEntry::OnDisk {
+                last_accessed,
+                size,
+                ..
+            } => {
+                disk_usage += size;
+                // Push the on-disk byte count so the eviction loop below
+                // subtracts the right amount from `disk_usage` when this
+                // entry is reclaimed.
+                disk_redis_entries.push((last_accessed.load(Relaxed), entry.key().clone(), *size));
+            }
+        }
     }
 
     // Sort newest first; we `pop()` the oldest from the back.
     disk_manifests.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
     memory_manifests.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
-    redis_entries.sort_by_key(|(t, _, _)| std::cmp::Reverse(*t));
+    disk_redis_entries.sort_by_key(|(t, _, _)| std::cmp::Reverse(*t));
+    memory_redis_entries.sort_by_key(|(t, _, _)| std::cmp::Reverse(*t));
 
     // Evict more aggressively than strictly necessary so we don't thrash on
     // every insert when we're hovering near the limit.
@@ -162,60 +182,73 @@ async fn evict(state: &'static State) {
     let now = state.now.load(Relaxed);
 
     loop {
-        if disk_usage > disk_target
-            && let Some((_, victim)) = disk_manifests.pop()
-        {
-            // Drop the oldest disk-tier manifest entirely. Any blob whose
-            // refcount falls to zero is removed from the cache (and its file
-            // deleted if on disk).
-            let Some((_, m)) = state.manifests.remove(&victim) else {
+        if disk_usage > disk_target {
+            if let Some((time, key, size)) = disk_redis_entries.last()
+                && disk_manifests
+                    .last()
+                    .map(|(t, _)| *t > *time)
+                    .unwrap_or(true)
+            {
+                if state.remove_redis(key) {
+                    disk_usage = disk_usage.saturating_sub(*size);
+                    state.metrics.eviction_redis_entries.fetch_add(1, Relaxed);
+                }
+                disk_redis_entries.pop();
                 continue;
-            };
-            state
-                .metrics
-                .eviction_manifests_deleted
-                .fetch_add(1, Relaxed);
-            memory_usage = memory_usage.saturating_sub(m.content.len() as u64);
-
-            for r in referenced_digests(&m.content) {
-                let Some(entry) = blobs.get_mut(&r) else {
+            }
+            if let Some((_, victim)) = disk_manifests.pop() {
+                // Drop the oldest disk-tier manifest entirely. Any blob whose
+                // refcount falls to zero is removed from the cache (and its file
+                // deleted if on disk).
+                let Some((_, m)) = state.manifests.remove(&victim) else {
                     continue;
                 };
-                let (in_memory, _size, disk_refs, memory_refs, last_accessed) = entry;
-                if *in_memory {
-                    *memory_refs = memory_refs.saturating_sub(1);
-                } else {
-                    *disk_refs = disk_refs.saturating_sub(1);
-                }
-                if *disk_refs != 0 || *memory_refs != 0 {
-                    continue;
-                }
-                if now - *last_accessed < BLOB_GRACE_SECONDS {
-                    continue;
-                }
-                if let Some((_, b)) = state.blobs.remove(&r) {
-                    state.metrics.eviction_blobs_deleted.fetch_add(1, Relaxed);
-                    match b.as_ref() {
-                        Blob::InMemory { content, .. } => {
-                            memory_usage = memory_usage.saturating_sub(content.len() as u64);
-                        }
-                        Blob::OnDisk { size, id, .. } => {
-                            disk_usage = disk_usage.saturating_sub(*size);
-                            delete_disk_blob(state, *id).await;
+                state
+                    .metrics
+                    .eviction_manifests_deleted
+                    .fetch_add(1, Relaxed);
+                memory_usage = memory_usage.saturating_sub(m.content.len() as u64);
+
+                for r in referenced_digests(&m.content) {
+                    let Some(entry) = blobs.get_mut(&r) else {
+                        continue;
+                    };
+                    let (in_memory, _size, disk_refs, memory_refs, last_accessed) = entry;
+                    if *in_memory {
+                        *memory_refs = memory_refs.saturating_sub(1);
+                    } else {
+                        *disk_refs = disk_refs.saturating_sub(1);
+                    }
+                    if *disk_refs != 0 || *memory_refs != 0 {
+                        continue;
+                    }
+                    if now.saturating_sub(*last_accessed) < BLOB_GRACE_SECONDS {
+                        continue;
+                    }
+                    if let Some((_, b)) = state.blobs.remove(&r) {
+                        state.metrics.eviction_blobs_deleted.fetch_add(1, Relaxed);
+                        match b.as_ref() {
+                            Blob::InMemory { content, .. } => {
+                                memory_usage = memory_usage.saturating_sub(content.len() as u64);
+                            }
+                            Blob::OnDisk { size, id, .. } => {
+                                disk_usage = disk_usage.saturating_sub(*size);
+                                delete_disk_blob(state, *id).await;
+                            }
                         }
                     }
                 }
+                state.tags.retain(|_, d| d != &victim);
+                info!(%victim, memory_usage, disk_usage, "evicted disk-tier manifest");
+                continue;
             }
-            state.tags.retain(|_, d| d != &victim);
-            info!(%victim, memory_usage, disk_usage, "evicted disk-tier manifest");
-            continue;
         }
 
         if memory_usage < memory_target {
             break;
         }
 
-        if let Some((time, key, size)) = redis_entries.last()
+        if let Some((time, key, size)) = memory_redis_entries.last()
             && memory_manifests
                 .last()
                 .map(|(t, _)| *t > *time)
@@ -225,7 +258,7 @@ async fn evict(state: &'static State) {
                 memory_usage = memory_usage.saturating_sub(*size);
                 state.metrics.eviction_redis_entries.fetch_add(1, Relaxed);
             }
-            redis_entries.pop();
+            memory_redis_entries.pop();
             continue;
         }
 
@@ -302,7 +335,7 @@ async fn evict(state: &'static State) {
         if *disk_refs != 0 || *memory_refs != 0 {
             continue;
         }
-        if now - *last_accessed < BLOB_GRACE_SECONDS {
+        if now.saturating_sub(*last_accessed) < BLOB_GRACE_SECONDS {
             continue;
         }
         if let Some((_, b)) = state.blobs.remove(digest) {
