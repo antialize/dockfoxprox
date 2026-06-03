@@ -266,7 +266,7 @@ impl Verbosity {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::try_parse()?;
 
