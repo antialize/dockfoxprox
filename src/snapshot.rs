@@ -223,6 +223,8 @@ pub async fn load_or_wipe(state: &State) -> Result<()> {
     let path = snapshot_path(state);
     match load(state, &path).await {
         Ok(stats) => {
+            // We need to clear the snapshot file on disk to avoid confusion on the next startup after crash.
+            tokio::fs::remove_file(&path).await?;
             info!(
                 blobs = stats.blobs,
                 blobs_pruned = stats.blobs_pruned,
