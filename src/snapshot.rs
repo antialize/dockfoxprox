@@ -19,7 +19,7 @@
 //! with the metadata that points at them.
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -62,7 +62,7 @@ struct TagEntry {
 struct ManifestEntry {
     digest: String,
     media_type: String,
-    last_used: i64,
+    last_used: u64,
     content: Bytes,
 }
 
@@ -73,7 +73,7 @@ struct BlobEntry {
     digest: String,
     media_type: String,
     size: u64,
-    last_accessed: i64,
+    last_accessed: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -359,7 +359,7 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
             Arc::new(Manifest {
                 content: m.content,
                 media_type: m.media_type,
-                last_used: AtomicI64::new(m.last_used),
+                last_used: AtomicU64::new(m.last_used),
             }),
         );
         stats.manifests += 1;
@@ -380,7 +380,7 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
                     Arc::new(Blob::OnDisk {
                         size: b.size,
                         media_type: b.media_type,
-                        last_accessed: AtomicI64::new(b.last_accessed),
+                        last_accessed: AtomicU64::new(b.last_accessed),
                     }),
                 );
                 stats.blobs += 1;
@@ -405,7 +405,7 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
             r.key,
             Arc::new(RedisEntry {
                 value: r.value,
-                last_accessed: AtomicI64::new(r.last_accessed),
+                last_accessed: AtomicU64::new(r.last_accessed),
             }),
         );
         stats.redis_entries += 1;

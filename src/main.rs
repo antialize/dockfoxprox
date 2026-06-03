@@ -22,6 +22,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{Instrument, debug, error, info, info_span, instrument};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+mod aligned_atomic;
 mod config;
 mod digest;
 mod docker;

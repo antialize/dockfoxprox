@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, atomic::AtomicI64},
+    sync::{Arc, atomic::AtomicU64},
 };
 
 use bytes::Bytes;
@@ -16,7 +16,7 @@ use crate::{
 /// Blobs younger than this are never deleted by eviction. Covers the
 /// upload-then-PUT-manifest race on the `self` registry and HEAD-then-PUT
 /// probes against pull-through cached blobs.
-const BLOB_GRACE_SECONDS: i64 = 5 * 3600;
+const BLOB_GRACE_SECONDS: u64 = 5 * 3600;
 
 /// Walk a manifest body (JSON) collecting every `"digest": "sha256:..."` value.
 /// Covers image manifests (config + layers) and indexes/manifest-lists
@@ -98,7 +98,7 @@ async fn evict(state: &'static State) {
     // Per-blob bookkeeping: (in_memory, size, disk_refs, memory_refs, last_accessed).
     let mut disk_usage: u64 = 0;
     let mut memory_usage: u64 = 0;
-    let mut blobs: HashMap<Digest, (bool, u64, u32, u32, i64)> = HashMap::new();
+    let mut blobs: HashMap<Digest, (bool, u64, u32, u32, u64)> = HashMap::new();
     for blob in state.blobs.iter() {
         let (in_memory, size) = match blob.value().as_ref() {
             Blob::InMemory { content, .. } => {
@@ -115,8 +115,8 @@ async fn evict(state: &'static State) {
     }
 
     // Manifests classified by whether any of their blobs is already on disk.
-    let mut disk_manifests: Vec<(i64, Digest)> = Vec::new();
-    let mut memory_manifests: Vec<(i64, Digest)> = Vec::new();
+    let mut disk_manifests: Vec<(u64, Digest)> = Vec::new();
+    let mut memory_manifests: Vec<(u64, Digest)> = Vec::new();
     for manifest in state.manifests.iter() {
         let digest = manifest.key();
         let content = &manifest.value().content;
@@ -281,7 +281,7 @@ async fn evict(state: &'static State) {
             let on_disk = Arc::new(Blob::OnDisk {
                 size: *size,
                 media_type: media_type.clone(),
-                last_accessed: AtomicI64::new(last_accessed.load(Relaxed)),
+                last_accessed: AtomicU64::new(last_accessed.load(Relaxed)),
             });
             state.blobs.insert(r.clone(), on_disk);
             state.metrics.eviction_blobs_to_disk.fetch_add(1, Relaxed);

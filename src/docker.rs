@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::AtomicU64;
 use std::task::{Context as TaskContext, Poll};
 
 use crate::config::DockerRegistry;
@@ -367,7 +367,7 @@ async fn get_head_manifest(
     let entry = Arc::new(Manifest {
         content: body,
         media_type,
-        last_used: AtomicI64::new(now),
+        last_used: AtomicU64::new(now),
     });
     state.insert_manifest(digest.clone(), entry.clone());
 
@@ -704,7 +704,7 @@ async fn put_manifest(
     let manifest = Arc::new(Manifest {
         content: Bytes::from(body),
         media_type: content_type,
-        last_used: AtomicI64::new(now),
+        last_used: AtomicU64::new(now),
     });
     let len = manifest.content.len();
     state.insert_manifest(digest.clone(), manifest);
@@ -762,7 +762,7 @@ async fn post_blob_upload(
         let blob = Arc::new(Blob::InMemory {
             content: Bytes::from(body),
             media_type,
-            last_accessed: AtomicI64::new(now),
+            last_accessed: AtomicU64::new(now),
         });
         state.insert_blob(got.clone(), blob);
         info!(%name, digest = %got, "blob stored (single-shot)");
@@ -886,7 +886,7 @@ async fn put_blob_upload(
     let blob = Arc::new(Blob::InMemory {
         content: Bytes::from(buf),
         media_type: "application/octet-stream".to_string(),
-        last_accessed: AtomicI64::new(now),
+        last_accessed: AtomicU64::new(now),
     });
     state.insert_blob(got.clone(), blob);
     info!(%name, %uuid, digest = %got, bytes = size, "blob stored (resumable)");
@@ -1186,7 +1186,7 @@ fn spawn_blob_fill(
             Arc::new(Blob::InMemory {
                 content: Bytes::from(buf),
                 media_type,
-                last_accessed: AtomicI64::new(now),
+                last_accessed: AtomicU64::new(now),
             }),
         );
     });

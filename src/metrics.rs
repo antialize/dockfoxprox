@@ -1,48 +1,48 @@
 //! Hand-rolled Prometheus-style metrics. We don't pull in a metrics crate
 //! because the set of counters is small and label-free: one `AtomicU64` per
 //! concept, rendered as text on `/metrics`.
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 
-use crate::state::State;
+use crate::{aligned_atomic::AlignedAtomicU64, state::State};
 
 #[derive(Default)]
 pub struct Metrics {
     // -- Docker registry endpoints -------------------------------------------
-    pub docker_manifest_get: AtomicU64,
-    pub docker_manifest_head: AtomicU64,
-    pub docker_manifest_put: AtomicU64,
-    pub docker_manifest_cache_hit: AtomicU64,
-    pub docker_manifest_cache_miss: AtomicU64,
+    pub docker_manifest_get: AlignedAtomicU64,
+    pub docker_manifest_head: AlignedAtomicU64,
+    pub docker_manifest_put: AlignedAtomicU64,
+    pub docker_manifest_cache_hit: AlignedAtomicU64,
+    pub docker_manifest_cache_miss: AlignedAtomicU64,
 
-    pub docker_blob_get: AtomicU64,
-    pub docker_blob_head: AtomicU64,
-    pub docker_blob_cache_hit_memory: AtomicU64,
-    pub docker_blob_cache_hit_disk: AtomicU64,
-    pub docker_blob_cache_miss: AtomicU64,
+    pub docker_blob_get: AlignedAtomicU64,
+    pub docker_blob_head: AlignedAtomicU64,
+    pub docker_blob_cache_hit_memory: AlignedAtomicU64,
+    pub docker_blob_cache_hit_disk: AlignedAtomicU64,
+    pub docker_blob_cache_miss: AlignedAtomicU64,
 
-    pub docker_blob_upload_post: AtomicU64,
-    pub docker_blob_upload_patch: AtomicU64,
-    pub docker_blob_upload_put: AtomicU64,
+    pub docker_blob_upload_post: AlignedAtomicU64,
+    pub docker_blob_upload_patch: AlignedAtomicU64,
+    pub docker_blob_upload_put: AlignedAtomicU64,
 
-    pub docker_auth_failures: AtomicU64,
-    pub docker_upstream_requests: AtomicU64,
-    pub docker_upstream_errors: AtomicU64,
+    pub docker_auth_failures: AlignedAtomicU64,
+    pub docker_upstream_requests: AlignedAtomicU64,
+    pub docker_upstream_errors: AlignedAtomicU64,
 
     // -- Redis protocol server -----------------------------------------------
-    pub redis_connections: AtomicU64,
-    pub redis_commands: AtomicU64,
-    pub redis_get_hit: AtomicU64,
-    pub redis_get_miss: AtomicU64,
-    pub redis_set: AtomicU64,
-    pub redis_del: AtomicU64,
-    pub redis_auth_failures: AtomicU64,
+    pub redis_connections: AlignedAtomicU64,
+    pub redis_commands: AlignedAtomicU64,
+    pub redis_get_hit: AlignedAtomicU64,
+    pub redis_get_miss: AlignedAtomicU64,
+    pub redis_set: AlignedAtomicU64,
+    pub redis_del: AlignedAtomicU64,
+    pub redis_auth_failures: AlignedAtomicU64,
 
     // -- Eviction ------------------------------------------------------------
-    pub eviction_runs: AtomicU64,
-    pub eviction_blobs_to_disk: AtomicU64,
-    pub eviction_blobs_deleted: AtomicU64,
-    pub eviction_manifests_deleted: AtomicU64,
-    pub eviction_redis_entries: AtomicU64,
+    pub eviction_runs: AlignedAtomicU64,
+    pub eviction_blobs_to_disk: AlignedAtomicU64,
+    pub eviction_blobs_deleted: AlignedAtomicU64,
+    pub eviction_manifests_deleted: AlignedAtomicU64,
+    pub eviction_redis_entries: AlignedAtomicU64,
 }
 
 /// Render the metrics in Prometheus text exposition format.

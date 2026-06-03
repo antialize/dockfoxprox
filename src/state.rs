@@ -5,16 +5,13 @@ use reqwest::Client;
 use sha2::Sha256;
 use std::{
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicU64},
-    },
+    sync::{Arc, atomic::AtomicU64},
 };
 use tokio::sync::Mutex;
 use tokio_tasks::{RunToken, TaskBuilder};
 use uuid::Uuid;
 
-use crate::{config::Config, digest::Digest, metrics::Metrics};
+use crate::{aligned_atomic::AlignedAtomicU64, config::Config, digest::Digest, metrics::Metrics};
 
 /// Key for the token cache. We store tokens by registry+scope, since that's what the client sends us.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -30,7 +27,7 @@ pub struct Manifest {
     /// The media type of the manifest, e.g. "application/vnd.docker.distribution.manifest.v2+json".
     pub media_type: String,
     /// Last-used timestamp, as seconds since the Unix epoch. Updated on every access, used for LRU eviction.
-    pub last_used: AtomicI64,
+    pub last_used: AtomicU64,
 }
 
 /// Blob content or on-disk metadata, plus last-used timestamp for LRU eviction.
@@ -39,19 +36,19 @@ pub enum Blob {
     OnDisk {
         size: u64,
         media_type: String,
-        last_accessed: AtomicI64,
+        last_accessed: AtomicU64,
     },
     /// In-memory blob content. We keep the whole content in memory for fast access, along with its media type and last-accessed timestamp for eviction.
     InMemory {
         content: Bytes,
         media_type: String,
-        last_accessed: AtomicI64,
+        last_accessed: AtomicU64,
     },
 }
 
 impl Blob {
     /// Get the last-accessed timestamp for this blob, for eviction purposes.
-    pub fn last_accessed(&self) -> &AtomicI64 {
+    pub fn last_accessed(&self) -> &AtomicU64 {
         match self {
             Blob::InMemory { last_accessed, .. } | Blob::OnDisk { last_accessed, .. } => {
                 last_accessed
@@ -63,7 +60,7 @@ impl Blob {
 /// A single Redis-protocol cache entry, stored only in memory.
 pub struct RedisEntry {
     pub value: Bytes,
-    pub last_accessed: AtomicI64,
+    pub last_accessed: AtomicU64,
 }
 
 /// Resumable upload state. Bytes accumulate in `buf`, hashed incrementally.
@@ -102,13 +99,13 @@ pub struct State {
     pub reqwest_client: Client,
 
     /// Current time, as seconds since the Unix epoch. Updated every second by a background task, used for eviction.
-    pub now: AtomicI64,
+    pub now: AlignedAtomicU64,
 
     /// Approximate total memory usage of in-memory blobs and manifests, for eviction purposes.
-    pub approx_memory_usage: AtomicU64,
+    pub approx_memory_usage: AlignedAtomicU64,
 
     /// Approximate total disk usage of on-disk blobs
-    pub disk_usage: AtomicU64,
+    pub disk_usage: AlignedAtomicU64,
 
     /// In-memory cache entries served via the Redis protocol (for ccache et al).
     pub redis_entries: DashMap<Bytes, Arc<RedisEntry>>,
@@ -125,7 +122,7 @@ async fn time_updater(state: &'static State) -> Result<(), ()> {
         let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64;
+            .as_secs();
         state.now.store(time, std::sync::atomic::Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
@@ -143,9 +140,9 @@ impl State {
             uploads: DashMap::new(),
             config,
             reqwest_client,
-            now: AtomicI64::new(0),
-            approx_memory_usage: AtomicU64::new(0),
-            disk_usage: AtomicU64::new(0),
+            now: AlignedAtomicU64::new(0),
+            approx_memory_usage: AlignedAtomicU64::new(0),
+            disk_usage: AlignedAtomicU64::new(0),
             redis_entries: DashMap::new(),
             metrics: Metrics::default(),
         }));
@@ -195,7 +192,7 @@ impl State {
         let new_value_len = value.len() as u64;
         let entry = Arc::new(RedisEntry {
             value,
-            last_accessed: AtomicI64::new(now),
+            last_accessed: AtomicU64::new(now),
         });
         match self.redis_entries.insert(key, entry) {
             Some(prev) => {
