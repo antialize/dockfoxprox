@@ -320,11 +320,11 @@ async fn main() -> Result<()> {
             .create(|rt| serve_http(http_listener, ctx, rt));
     }
 
-    {
-        let addr: SocketAddr = format!("0.0.0.0:{}", ctx.config.https_port).parse()?;
+    if let Some(port) = ctx.config.https_port {
+        let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
         let listener = TcpListener::bind(addr).await?;
         let acceptor = TlsAcceptor::from(Arc::new(build_tls_config()?));
-        info!(%addr, "listening");
+        info!(%addr, "https listening");
         TaskBuilder::new("https server")
             .main()
             .create(|rt| serve_https(listener, acceptor, ctx, rt));
