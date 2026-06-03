@@ -1,0 +1,37 @@
+[package]
+name = "dockfoxprox"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+ciborium = "0.2"
+bytes = { version = "1", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["http1", "http2", "server", "tokio", "server-graceful", "service"] }
+percent-encoding = "2"
+rcgen = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["stream", "http2", "rustls", "charset", "json"] }
+rustls = "0.23"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2"
+tokio = {"version" = "1", "features" = ["full"]}
+tokio-rustls = "0.26"
+tokio-tasks = "0.5"
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["set-header"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+sd-notify = "0.5.0"
