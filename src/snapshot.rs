@@ -40,7 +40,12 @@ const SNAPSHOT_TMP: &str = "snapshot.cbor.tmp";
 /// spilling them to a separate file under `<data_folder>/blobs/`. Small
 /// entries are cheap to keep in the snapshot CBOR and avoid the per-file
 /// I/O cost on save and on startup load.
-const SNAPSHOT_INLINE_THRESHOLD: usize = 1024;
+///
+/// The eviction code uses the same threshold to decide which in-memory blobs
+/// are too small to be worth spilling under memory pressure - those are
+/// instead accounted as disk-tier and deleted in place when their manifest
+/// ages out.
+pub const SNAPSHOT_INLINE_THRESHOLD: usize = 1024;
 
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
