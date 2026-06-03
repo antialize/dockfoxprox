@@ -47,8 +47,6 @@ struct Snapshot {
     blobs: Vec<BlobEntry>,
     #[serde(default)]
     redis_entries: Vec<RedisEntryEntry>,
-    #[serde(default)]
-    metrics: MetricsSnapshot,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,67 +78,7 @@ struct BlobEntry {
 struct RedisEntryEntry {
     key: Bytes,
     value: Bytes,
-    last_accessed: i64,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct MetricsSnapshot {
-    #[serde(default)]
-    docker_manifest_get: u64,
-    #[serde(default)]
-    docker_manifest_head: u64,
-    #[serde(default)]
-    docker_manifest_put: u64,
-    #[serde(default)]
-    docker_manifest_cache_hit: u64,
-    #[serde(default)]
-    docker_manifest_cache_miss: u64,
-    #[serde(default)]
-    docker_blob_get: u64,
-    #[serde(default)]
-    docker_blob_head: u64,
-    #[serde(default)]
-    docker_blob_cache_hit_memory: u64,
-    #[serde(default)]
-    docker_blob_cache_hit_disk: u64,
-    #[serde(default)]
-    docker_blob_cache_miss: u64,
-    #[serde(default)]
-    docker_blob_upload_post: u64,
-    #[serde(default)]
-    docker_blob_upload_patch: u64,
-    #[serde(default)]
-    docker_blob_upload_put: u64,
-    #[serde(default)]
-    docker_auth_failures: u64,
-    #[serde(default)]
-    docker_upstream_requests: u64,
-    #[serde(default)]
-    docker_upstream_errors: u64,
-    #[serde(default)]
-    redis_connections: u64,
-    #[serde(default)]
-    redis_commands: u64,
-    #[serde(default)]
-    redis_get_hit: u64,
-    #[serde(default)]
-    redis_get_miss: u64,
-    #[serde(default)]
-    redis_set: u64,
-    #[serde(default)]
-    redis_del: u64,
-    #[serde(default)]
-    redis_auth_failures: u64,
-    #[serde(default)]
-    eviction_runs: u64,
-    #[serde(default)]
-    eviction_blobs_to_disk: u64,
-    #[serde(default)]
-    eviction_blobs_deleted: u64,
-    #[serde(default)]
-    eviction_manifests_deleted: u64,
-    #[serde(default)]
-    eviction_redis_entries: u64,
+    last_accessed: u64,
 }
 
 fn snapshot_path(state: &State) -> PathBuf {
@@ -240,7 +178,6 @@ pub async fn save(state: &State) -> Result<()> {
         manifests,
         blobs: blob_entries,
         redis_entries,
-        metrics: snapshot_metrics(state),
     };
 
     let path = snapshot_path(state);
@@ -411,8 +348,6 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
         stats.redis_entries += 1;
     }
 
-    restore_metrics(state, &snap.metrics);
-
     state.approx_memory_usage.store(memory_usage, Relaxed);
     state.disk_usage.store(disk_usage, Relaxed);
     Ok(stats)
@@ -432,85 +367,4 @@ async fn wipe_cache(state: &State) {
     state.redis_entries.clear();
     state.approx_memory_usage.store(0, Relaxed);
     state.disk_usage.store(0, Relaxed);
-}
-
-fn snapshot_metrics(state: &State) -> MetricsSnapshot {
-    let m = &state.metrics;
-    MetricsSnapshot {
-        docker_manifest_get: m.docker_manifest_get.load(Relaxed),
-        docker_manifest_head: m.docker_manifest_head.load(Relaxed),
-        docker_manifest_put: m.docker_manifest_put.load(Relaxed),
-        docker_manifest_cache_hit: m.docker_manifest_cache_hit.load(Relaxed),
-        docker_manifest_cache_miss: m.docker_manifest_cache_miss.load(Relaxed),
-        docker_blob_get: m.docker_blob_get.load(Relaxed),
-        docker_blob_head: m.docker_blob_head.load(Relaxed),
-        docker_blob_cache_hit_memory: m.docker_blob_cache_hit_memory.load(Relaxed),
-        docker_blob_cache_hit_disk: m.docker_blob_cache_hit_disk.load(Relaxed),
-        docker_blob_cache_miss: m.docker_blob_cache_miss.load(Relaxed),
-        docker_blob_upload_post: m.docker_blob_upload_post.load(Relaxed),
-        docker_blob_upload_patch: m.docker_blob_upload_patch.load(Relaxed),
-        docker_blob_upload_put: m.docker_blob_upload_put.load(Relaxed),
-        docker_auth_failures: m.docker_auth_failures.load(Relaxed),
-        docker_upstream_requests: m.docker_upstream_requests.load(Relaxed),
-        docker_upstream_errors: m.docker_upstream_errors.load(Relaxed),
-        redis_connections: m.redis_connections.load(Relaxed),
-        redis_commands: m.redis_commands.load(Relaxed),
-        redis_get_hit: m.redis_get_hit.load(Relaxed),
-        redis_get_miss: m.redis_get_miss.load(Relaxed),
-        redis_set: m.redis_set.load(Relaxed),
-        redis_del: m.redis_del.load(Relaxed),
-        redis_auth_failures: m.redis_auth_failures.load(Relaxed),
-        eviction_runs: m.eviction_runs.load(Relaxed),
-        eviction_blobs_to_disk: m.eviction_blobs_to_disk.load(Relaxed),
-        eviction_blobs_deleted: m.eviction_blobs_deleted.load(Relaxed),
-        eviction_manifests_deleted: m.eviction_manifests_deleted.load(Relaxed),
-        eviction_redis_entries: m.eviction_redis_entries.load(Relaxed),
-    }
-}
-
-fn restore_metrics(state: &State, snap: &MetricsSnapshot) {
-    let m = &state.metrics;
-    fn set(a: &AtomicU64, v: u64) {
-        a.store(v, Relaxed);
-    }
-    set(&m.docker_manifest_get, snap.docker_manifest_get);
-    set(&m.docker_manifest_head, snap.docker_manifest_head);
-    set(&m.docker_manifest_put, snap.docker_manifest_put);
-    set(&m.docker_manifest_cache_hit, snap.docker_manifest_cache_hit);
-    set(
-        &m.docker_manifest_cache_miss,
-        snap.docker_manifest_cache_miss,
-    );
-    set(&m.docker_blob_get, snap.docker_blob_get);
-    set(&m.docker_blob_head, snap.docker_blob_head);
-    set(
-        &m.docker_blob_cache_hit_memory,
-        snap.docker_blob_cache_hit_memory,
-    );
-    set(
-        &m.docker_blob_cache_hit_disk,
-        snap.docker_blob_cache_hit_disk,
-    );
-    set(&m.docker_blob_cache_miss, snap.docker_blob_cache_miss);
-    set(&m.docker_blob_upload_post, snap.docker_blob_upload_post);
-    set(&m.docker_blob_upload_patch, snap.docker_blob_upload_patch);
-    set(&m.docker_blob_upload_put, snap.docker_blob_upload_put);
-    set(&m.docker_auth_failures, snap.docker_auth_failures);
-    set(&m.docker_upstream_requests, snap.docker_upstream_requests);
-    set(&m.docker_upstream_errors, snap.docker_upstream_errors);
-    set(&m.redis_connections, snap.redis_connections);
-    set(&m.redis_commands, snap.redis_commands);
-    set(&m.redis_get_hit, snap.redis_get_hit);
-    set(&m.redis_get_miss, snap.redis_get_miss);
-    set(&m.redis_set, snap.redis_set);
-    set(&m.redis_del, snap.redis_del);
-    set(&m.redis_auth_failures, snap.redis_auth_failures);
-    set(&m.eviction_runs, snap.eviction_runs);
-    set(&m.eviction_blobs_to_disk, snap.eviction_blobs_to_disk);
-    set(&m.eviction_blobs_deleted, snap.eviction_blobs_deleted);
-    set(
-        &m.eviction_manifests_deleted,
-        snap.eviction_manifests_deleted,
-    );
-    set(&m.eviction_redis_entries, snap.eviction_redis_entries);
 }
