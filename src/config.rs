@@ -42,6 +42,13 @@ pub struct Config {
     #[serde(default = "default_memory_limit")]
     pub memory_limit: Size,
 
+    /// Sub-budget within `memory_limit` reserved for small in-memory items
+    /// (blobs and redis values at or below `state::MEMORY_TIER_THRESHOLD`).
+    /// The remainder, `memory_limit - small_memory_limit`, is available to
+    /// large in-memory items and manifests. Defaults to `memory_limit / 8`.
+    #[serde(default)]
+    pub small_memory_limit: Option<Size>,
+
     #[serde(default = "default_disk_limit")]
     pub disk_limit: Size,
 
@@ -70,4 +77,14 @@ fn default_memory_limit() -> Size {
 
 fn default_disk_limit() -> Size {
     Size(1024 * 1024 * 1024 * 100)
+}
+
+impl Config {
+    /// Effective small-items sub-budget: `small_memory_limit` if set,
+    /// otherwise `memory_limit / 8`.
+    pub fn small_memory_limit(&self) -> u64 {
+        self.small_memory_limit
+            .map(|s| s.0)
+            .unwrap_or(self.memory_limit.0 / 8)
+    }
 }

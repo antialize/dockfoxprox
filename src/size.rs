@@ -8,6 +8,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 /// A byte count. Construct via `Size::from_str`, serde, or directly.
+#[derive(Copy, Clone)]
 pub struct Size(pub u64);
 
 impl std::fmt::Display for Size {

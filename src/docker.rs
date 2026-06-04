@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::task::{Context as TaskContext, Poll};
 
 use crate::config::DockerRegistry;
@@ -83,6 +83,7 @@ pub async fn handle_request(
     state: &'static State,
     req: Request<Incoming>,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let is_head = req.method() == Method::HEAD;
     match handle_request_inner(state, req).await {
         Ok(r) => Ok(r),
         Err(e) => match e {
@@ -99,7 +100,9 @@ pub async fn handle_request(
                     .expect("static response"));
             }
             DockerError::NotFound => {
-                warn!(error = %e, "not found");
+                if !is_head {
+                    warn!(error = %e, "not found");
+                }
                 return Ok(error_response(StatusCode::NOT_FOUND, "Not found"));
             }
             DockerError::InvalidHost(_) => {
@@ -223,6 +226,13 @@ async fn handle_request_inner(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 put_blob_upload(state, req, upstream_host, name, uuid_str).await
             }
+            Method::DELETE => {
+                state
+                    .metrics
+                    .docker_blob_upload_delete
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                delete_blob_upload(state, upstream_host, name, uuid_str).await
+            }
             Method::GET => get_blob_upload_status(state, upstream_host, name, uuid_str).await,
             _ => Err(DockerError::MethodNotAllowed(req.method().clone())),
         }
@@ -324,6 +334,7 @@ async fn get_head_manifest(
     if let Some(entry) = state.manifests.get(&digest) {
         let now = state.now.load(Ordering::Relaxed);
         entry.last_used.store(now, Ordering::Relaxed);
+        entry.evicted.store(false, Ordering::Relaxed);
         state
             .metrics
             .docker_manifest_cache_hit
@@ -376,6 +387,7 @@ async fn get_head_manifest(
         content: body,
         media_type,
         last_used: AtomicU64::new(now),
+        evicted: AtomicBool::new(false),
     });
     state.insert_manifest(digest.clone(), entry.clone());
 
@@ -713,6 +725,7 @@ async fn put_manifest(
         content: Bytes::from(body),
         media_type: content_type,
         last_used: AtomicU64::new(now),
+        evicted: AtomicBool::new(false),
     });
     let len = manifest.content.len();
     state.insert_manifest(digest.clone(), manifest);
@@ -936,6 +949,30 @@ async fn get_blob_upload_status(
         .header("Location", format!("/v2/self/{name}/blobs/uploads/{uuid}"))
         .header("Range", format!("0-{}", end.saturating_sub(1)))
         .header("Docker-Upload-UUID", uuid.to_string())
+        .body(empty())
+        .map_err(Into::into)
+}
+
+/// DELETE /v2/self/<name>/blobs/uploads/<uuid> - cancel a resumable upload.
+/// Per the OCI distribution spec this returns 204 No Content; clients such as
+/// buildah call it after a HEAD hit on the target blob or on any error path.
+async fn delete_blob_upload(
+    state: &'static State,
+    upstream_host: String,
+    name: String,
+    uuid_str: String,
+) -> Result<Response<ProxyBody>, DockerError> {
+    ensure_self(&upstream_host, &Method::DELETE)?;
+
+    let Ok(uuid) = Uuid::parse_str(&uuid_str) else {
+        return Ok(error_response(StatusCode::BAD_REQUEST, "invalid upload id"));
+    };
+    let removed = state.uploads.remove(&uuid).is_some();
+    debug!(%name, %uuid, removed, "blob upload cancelled");
+
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("Content-Length", "0")
         .body(empty())
         .map_err(Into::into)
 }
