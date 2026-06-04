@@ -102,24 +102,40 @@ pub(crate) async fn evict(state: &'static State) {
     // manifest eviction path delete them in place when they age out.
     let mut disk_usage: u64 = 0;
     let mut memory_usage: u64 = 0;
+    // Per-component breakdown and per-tier oldest touch-time, observed at
+    // the start of this pass. We don't try to keep these accurate as items
+    // get evicted below - we just snapshot them onto `state.metrics` at the
+    // very end. `u64::MAX` is the "no items observed" sentinel for oldest.
+    let mut memory_docker_bytes: u64 = 0;
+    let mut memory_redis_bytes: u64 = 0;
+    let mut disk_docker_bytes: u64 = 0;
+    let mut disk_redis_bytes: u64 = 0;
+    let mut oldest_memory: u64 = u64::MAX;
+    let mut oldest_disk: u64 = u64::MAX;
     let mut blobs: HashMap<Digest, (bool, u64, u32, u32, u64)> = HashMap::new();
     for blob in state.blobs.iter() {
+        let last_accessed = blob.value().last_accessed().load(Relaxed);
         let (in_memory, size) = match blob.value().as_ref() {
             Blob::InMemory { content, .. } if content.len() > SNAPSHOT_INLINE_THRESHOLD => {
                 memory_usage += content.len() as u64;
+                memory_docker_bytes += content.len() as u64;
+                oldest_memory = oldest_memory.min(last_accessed);
                 (true, content.len() as u64)
             }
             Blob::InMemory { content, .. } => {
                 // Small in-memory blob: treat as virtually on-disk.
                 disk_usage += content.len() as u64;
+                disk_docker_bytes += content.len() as u64;
+                oldest_disk = oldest_disk.min(last_accessed);
                 (false, content.len() as u64)
             }
             Blob::OnDisk { size, .. } => {
                 disk_usage += *size;
+                disk_docker_bytes += *size;
+                oldest_disk = oldest_disk.min(last_accessed);
                 (false, *size)
             }
         };
-        let last_accessed = blob.value().last_accessed().load(Relaxed);
         blobs.insert(blob.key().clone(), (in_memory, size, 0, 0, last_accessed));
     }
 
@@ -130,6 +146,9 @@ pub(crate) async fn evict(state: &'static State) {
         let digest = manifest.key();
         let content = &manifest.value().content;
         memory_usage += content.len() as u64;
+        memory_docker_bytes += content.len() as u64;
+        let last_used = manifest.value().last_used.load(Relaxed);
+        oldest_memory = oldest_memory.min(last_used);
         let mut on_disk = false;
         for r in referenced_digests(content) {
             if let Some((in_memory, _size, disk_refs, memory_refs, _last)) = blobs.get_mut(&r) {
@@ -162,12 +181,12 @@ pub(crate) async fn evict(state: &'static State) {
                 last_accessed,
                 ..
             } if value.len() > SNAPSHOT_INLINE_THRESHOLD => {
-                memory_usage += value.len() as u64 + entry.key().len() as u64;
-                memory_redis_entries.push((
-                    last_accessed.load(Relaxed),
-                    entry.key().clone(),
-                    value.len() as u64,
-                ));
+                let bytes = value.len() as u64 + entry.key().len() as u64;
+                memory_usage += bytes;
+                memory_redis_bytes += bytes;
+                let t = last_accessed.load(Relaxed);
+                oldest_memory = oldest_memory.min(t);
+                memory_redis_entries.push((t, entry.key().clone(), value.len() as u64));
             }
             RedisEntry::InMemory {
                 value,
@@ -177,12 +196,12 @@ pub(crate) async fn evict(state: &'static State) {
                 // Small in-memory redis entry: too small to be worth spilling
                 // to disk under memory pressure. Account it against the disk
                 // budget so the disk-tier eviction path ages it out.
-                disk_usage += value.len() as u64 + entry.key().len() as u64;
-                disk_redis_entries.push((
-                    last_accessed.load(Relaxed),
-                    entry.key().clone(),
-                    value.len() as u64 + entry.key().len() as u64,
-                ));
+                let bytes = value.len() as u64 + entry.key().len() as u64;
+                disk_usage += bytes;
+                disk_redis_bytes += bytes;
+                let t = last_accessed.load(Relaxed);
+                oldest_disk = oldest_disk.min(t);
+                disk_redis_entries.push((t, entry.key().clone(), bytes));
             }
             RedisEntry::OnDisk {
                 last_accessed,
@@ -190,10 +209,13 @@ pub(crate) async fn evict(state: &'static State) {
                 ..
             } => {
                 disk_usage += size;
+                disk_redis_bytes += size;
+                let t = last_accessed.load(Relaxed);
+                oldest_disk = oldest_disk.min(t);
                 // Push the on-disk byte count so the eviction loop below
                 // subtracts the right amount from `disk_usage` when this
                 // entry is reclaimed.
-                disk_redis_entries.push((last_accessed.load(Relaxed), entry.key().clone(), *size));
+                disk_redis_entries.push((t, entry.key().clone(), *size));
             }
         }
     }
@@ -401,6 +423,43 @@ pub(crate) async fn evict(state: &'static State) {
 
     state.approx_memory_usage.store(memory_usage, Relaxed);
     state.disk_usage.store(disk_usage, Relaxed);
+
+    // Snapshot the per-component breakdown and the oldest touch-times
+    // observed at the start of this pass onto the metrics. We don't try to
+    // keep these in sync with the evictions that happened in the loop
+    // above - same trade-off as `disk_usage`.
+    state
+        .metrics
+        .memory_usage_docker_bytes
+        .store(memory_docker_bytes, Relaxed);
+    state
+        .metrics
+        .memory_usage_redis_bytes
+        .store(memory_redis_bytes, Relaxed);
+    state
+        .metrics
+        .disk_usage_docker_bytes
+        .store(disk_docker_bytes, Relaxed);
+    state
+        .metrics
+        .disk_usage_redis_bytes
+        .store(disk_redis_bytes, Relaxed);
+    state.metrics.oldest_memory_touch_time.store(
+        if oldest_memory == u64::MAX {
+            0
+        } else {
+            oldest_memory
+        },
+        Relaxed,
+    );
+    state.metrics.oldest_disk_touch_time.store(
+        if oldest_disk == u64::MAX {
+            0
+        } else {
+            oldest_disk
+        },
+        Relaxed,
+    );
 }
 
 /// Periodic eviction loop. Runs every 30s and triggers `evict` whenever
