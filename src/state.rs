@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, atomic::AtomicU64},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_tasks::{RunToken, TaskBuilder};
 use uuid::Uuid;
 
@@ -176,6 +176,11 @@ pub struct State {
 
     /// Next ID to use for uploads and Redis on-disk entries.
     pub next_id: AlignedAtomicU64,
+
+    /// Notified by every `insert_*` helper whenever a usage bucket grows.
+    /// The eviction loop waits on this so it can react to incoming
+    /// pressure without polling on a fixed interval.
+    pub eviction_notify: Notify,
 }
 
 /// Background task that updates `state.now` every second. Spawned by
@@ -215,6 +220,7 @@ impl State {
             redis_entries: DashMap::new(),
             metrics: Metrics::default(),
             next_id: AlignedAtomicU64::new(0),
+            eviction_notify: Notify::new(),
         }));
 
         TaskBuilder::new("time updater")
@@ -236,6 +242,7 @@ impl State {
             let (old_bucket, old_bytes) = blob_bucket(self, &old);
             old_bucket.fetch_sub(old_bytes as i64, Relaxed);
         }
+        self.eviction_notify.notify_one();
     }
 
     /// Remove a blob from the cache, returning the removed value (if any)
@@ -258,6 +265,7 @@ impl State {
             .unwrap_or(0);
         self.manifest_memory_usage
             .fetch_add(new_len - old_len, Relaxed);
+        self.eviction_notify.notify_one();
     }
 
     /// Remove a manifest from the cache, returning the removed value (if any)
@@ -281,28 +289,34 @@ impl State {
     }
 
     /// Insert or replace a Redis-protocol cache entry, adjusting the
-    /// small/large redis memory counters by the net byte delta. If the
-    /// replaced entry was on disk, the backing file is removed.
+    /// small/large redis memory counters by the net byte delta. The key's
+    /// bytes are always charged to `small_redis_memory_usage` (the key
+    /// lives in the in-memory DashMap regardless of where the value
+    /// sits); only the value tier moves around. If the replaced entry was
+    /// on disk, the backing file is removed.
     pub fn insert_redis(&self, key: Bytes, value: Bytes) -> Arc<RedisEntry> {
         let now = self.now.load(Relaxed);
-        let key_len = key.len() as u64;
+        let key_len = key.len() as i64;
         let entry = Arc::new(RedisEntry::InMemory {
             id: self.next_id.fetch_add(1, Relaxed),
             last_accessed: AtomicU64::new(now),
             value,
         });
-        let (new_bucket, new_bytes) = redis_bucket(self, &entry, key_len);
+        let (new_bucket, new_bytes) = redis_value_bucket(self, &entry);
         new_bucket.fetch_add(new_bytes as i64, Relaxed);
 
         if let Some(old) = self.redis_entries.insert(key, entry.clone()) {
-            // Same key, so the replaced entry's key charge equals `key_len`.
-            let (old_bucket, old_bytes) = redis_bucket(self, &old, key_len);
+            let (old_bucket, old_bytes) = redis_value_bucket(self, &old);
             old_bucket.fetch_sub(old_bytes as i64, Relaxed);
             if let RedisEntry::OnDisk { id, .. } = old.as_ref() {
                 let path = self.cache_path(*id);
                 tokio::spawn(tokio::fs::remove_file(path));
             }
+        } else {
+            // New key in the map - charge its bytes to the small pool.
+            self.small_redis_memory_usage.fetch_add(key_len, Relaxed);
         }
+        self.eviction_notify.notify_one();
         entry
     }
 
@@ -310,8 +324,10 @@ impl State {
     pub fn remove_redis(&self, key: &[u8]) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         if let Some((k, v)) = self.redis_entries.remove(key) {
-            let (bucket, bytes) = redis_bucket(self, &v, k.len() as u64);
+            let (bucket, bytes) = redis_value_bucket(self, &v);
             bucket.fetch_sub(bytes as i64, Relaxed);
+            self.small_redis_memory_usage
+                .fetch_sub(k.len() as i64, Relaxed);
             if let RedisEntry::OnDisk { id, .. } = v.as_ref() {
                 let path = self.cache_path(*id);
                 tokio::spawn(tokio::fs::remove_file(path));
@@ -333,7 +349,7 @@ impl State {
             false
         });
         self.small_redis_memory_usage.store(0, Relaxed);
-        self.large_blob_memory_usage.store(0, Relaxed);
+        self.large_redis_memory_usage.store(0, Relaxed);
         self.redis_disk_usage.store(0, Relaxed);
         tokio::spawn(async move {
             for id in delete {
@@ -388,22 +404,16 @@ fn blob_bucket<'a>(state: &'a State, blob: &Blob) -> (&'a AlignedAtomicI64, u64)
     }
 }
 
-/// Returns the bucket the given redis entry is charged to and its byte
-/// size (key + value for in-memory entries).
-fn redis_bucket<'a>(
-    state: &'a State,
-    entry: &RedisEntry,
-    key_len: u64,
-) -> (&'a AlignedAtomicI64, u64) {
+/// Returns the bucket the given redis entry's value is charged to and
+/// its byte size. The key is always charged separately to
+/// `small_redis_memory_usage` since it stays resident regardless of
+/// where the value lives.
+fn redis_value_bucket<'a>(state: &'a State, entry: &RedisEntry) -> (&'a AlignedAtomicI64, u64) {
     match entry {
-        RedisEntry::InMemory { value, .. } if value.len() > MEMORY_TIER_THRESHOLD => (
-            &state.large_redis_memory_usage,
-            value.len() as u64 + key_len,
-        ),
-        RedisEntry::InMemory { value, .. } => (
-            &state.small_redis_memory_usage,
-            value.len() as u64 + key_len,
-        ),
+        RedisEntry::InMemory { value, .. } if value.len() > MEMORY_TIER_THRESHOLD => {
+            (&state.large_redis_memory_usage, value.len() as u64)
+        }
+        RedisEntry::InMemory { value, .. } => (&state.small_redis_memory_usage, value.len() as u64),
         RedisEntry::OnDisk { size, .. } => (&state.redis_disk_usage, *size),
     }
 }

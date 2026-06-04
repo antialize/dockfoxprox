@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, atomic::AtomicU64},
 };
 
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio_tasks::{RunToken, cancelable};
 use tracing::{debug, warn};
@@ -102,7 +103,7 @@ async fn delete_disk_blob(state: &State, id: u64) {
 ///
 /// After the loop, a final sweep deletes any blobs whose refcount fell
 /// to zero (provided they're outside `BLOB_GRACE_SECONDS`).
-pub(crate) async fn evict(state: &'static State) {
+pub(crate) async fn evict(state: &'static State) -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
 
     state.metrics.eviction_runs.fetch_add(1, Relaxed);
@@ -354,17 +355,10 @@ pub(crate) async fn evict(state: &'static State) {
                         else {
                             continue;
                         };
-
                         let size = content.len() as u64;
-                        if let Err(e) = write_blob_to_disk(state, *id, content).await {
-                            warn!(digest=%r, error=%e, "failed to write blob to disk; keeping in memory");
-                            // Roll back the mem_mfst_refs decrement so future spill
-                            // attempts can retry.
-                            if !old {
-                                bb.unevicted_refs = bb.unevicted_refs.saturating_add(1);
-                            }
-                            continue;
-                        }
+                        write_blob_to_disk(state, *id, content)
+                            .await
+                            .with_context(|| format!("Failed to write blob {} to disk", r))?;
                         let on_disk = Arc::new(Blob::OnDisk {
                             size,
                             media_type: media_type.clone(),
@@ -382,11 +376,40 @@ pub(crate) async fn evict(state: &'static State) {
                         digest,
                     });
                 }
-                EvictionCandidate::Redis { key, size, .. } => {
-                    if state.remove_redis(&key) {
-                        large_redis_memory = large_redis_memory.saturating_sub(size);
-                        state.metrics.eviction_redis_entries.fetch_add(1, Relaxed);
-                    }
+                EvictionCandidate::Redis {
+                    key,
+                    size,
+                    last_accessed,
+                } => {
+                    // Large redis entries are spilled to disk.
+                    let Some(val) = state.redis_entries.get(&key).map(|e| e.value().clone()) else {
+                        continue;
+                    };
+                    let RedisEntry::InMemory { value, id, .. } = val.as_ref() else {
+                        continue;
+                    };
+                    write_blob_to_disk(state, *id, value)
+                        .await
+                        .with_context(|| {
+                            format!("Failed to write redis entry {:?} to disk", key)
+                        })?;
+                    state.redis_entries.insert(
+                        key.clone(),
+                        Arc::new(RedisEntry::OnDisk {
+                            size,
+                            last_accessed: AtomicU64::new(last_accessed),
+                            id: *id,
+                        }),
+                    );
+                    large_redis_memory = large_redis_memory.saturating_sub(size);
+                    redis_disk = redis_disk.saturating_add(size);
+                    state.metrics.eviction_redis_entries.fetch_add(1, Relaxed);
+                    // Now eligible to be reaped under disk pressure.
+                    disk_candidates.push(EvictionCandidate::Redis {
+                        key,
+                        size,
+                        last_accessed,
+                    });
                 }
             }
             continue;
@@ -496,16 +519,50 @@ pub(crate) async fn evict(state: &'static State) {
             .unwrap_or(now),
         Relaxed,
     );
+
+    state
+        .small_blob_memory_usage
+        .store(small_blob_memory as i64, Relaxed);
+    state
+        .large_blob_memory_usage
+        .store(large_blob_memory as i64, Relaxed);
+    state.blob_disk_usage.store(blob_disk as i64, Relaxed);
+    state
+        .small_redis_memory_usage
+        .store(small_redis_memory as i64, Relaxed);
+    state
+        .large_redis_memory_usage
+        .store(large_redis_memory as i64, Relaxed);
+    state.redis_disk_usage.store(redis_disk as i64, Relaxed);
+
+    Ok(())
 }
 
-/// Periodic eviction loop. Wakes every 30s and triggers `evict` whenever
-/// any of the three pools is over its limit. Returns when `rt` is
-/// cancelled.
-pub async fn evict_loop(state: &'static State, rt: RunToken) -> Result<(), ()> {
-    while cancelable(&rt, tokio::time::sleep(std::time::Duration::from_secs(30)))
-        .await
-        .is_ok()
-    {
+/// Periodic eviction loop. Wakes on `state.eviction_notify` (signalled by
+/// every `insert_*` helper) or every 30s as a backstop, runs `evict`
+/// whenever any of the three pools is over its limit, then sleeps a short
+/// cool-down period so a burst of follow-up inserts coalesces into the
+/// next pass instead of spinning. Returns when `rt` is cancelled.
+pub async fn evict_loop(state: &'static State, rt: RunToken) -> Result<()> {
+    /// How long to wait after an eviction pass before consulting the
+    /// notify again. Without this, a flood of `insert_*` calls right
+    /// after we finish would re-trigger us immediately.
+    const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Backstop timeout - we always re-check the limits at least this
+    /// often even when nothing notifies us, so manual snapshot loads or
+    /// clock-driven changes still get reacted to.
+    const BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+
+    loop {
+        let wait = async {
+            tokio::select! {
+                _ = state.eviction_notify.notified() => {}
+                _ = tokio::time::sleep(BACKSTOP) => {}
+            }
+        };
+        if cancelable(&rt, wait).await.is_err() {
+            break;
+        }
         let small = state.small_memory_usage();
         let total = state.total_memory_usage();
         let disk = state.total_disk_usage();
@@ -517,7 +574,10 @@ pub async fn evict_loop(state: &'static State, rt: RunToken) -> Result<(), ()> {
                 small,
                 total, disk, small_limit, memory_limit, disk_limit, "running eviction"
             );
-            evict(state).await;
+            evict(state).await.context("Evict")?;
+        }
+        if cancelable(&rt, tokio::time::sleep(COOLDOWN)).await.is_err() {
+            break;
         }
     }
     Ok(())
@@ -625,6 +685,7 @@ mod tests {
             redis_entries: DashMap::new(),
             metrics: Metrics::default(),
             next_id: AlignedAtomicU64::new(0),
+            eviction_notify: tokio::sync::Notify::new(),
         }))
     }
 
@@ -788,10 +849,13 @@ mod tests {
     // ---------------- Redis eviction ----------------
 
     #[tokio::test]
-    async fn redis_large_entries_evicted_oldest_first_on_memory_pressure() {
-        // Large values (above SNAPSHOT_INLINE_THRESHOLD) are tracked against
-        // the memory budget. With memory_limit = 4*big, the 25% slack means
-        // target = 3*big, so we expect at least the oldest to be dropped.
+    async fn redis_large_entries_spilled_to_disk_under_memory_pressure() {
+        // Large values (above MEMORY_TIER_THRESHOLD) are tracked against
+        // the large-memory pool. With memory_limit = 4*big the 25% slack
+        // gives target = 3*big, so we expect at least the oldest to move
+        // to disk. The entries themselves remain in `redis_entries` -
+        // they just transition from `InMemory` to `OnDisk`, with the
+        // value bytes written to `cache_path(id)`.
         let big_size = SNAPSHOT_INLINE_THRESHOLD + 1024;
         let state = make_state((big_size as u64) * 4, 1024 * 1024 * 1024, "redis-large");
         let big = vec![b'x'; big_size];
@@ -799,9 +863,54 @@ mod tests {
         insert_redis(state, b"older", &big, OLD + 1);
         insert_redis(state, b"newer", &big, OLD + 2);
         insert_redis(state, b"newest", &big, OLD + 3);
-        evict(state).await;
+        evict(state).await.unwrap();
+
+        // All four keys are still present; the oldest one has been spilled.
+        let entry = state
+            .redis_entries
+            .get(b"oldest".as_ref())
+            .expect("oldest key must still be in the map after spill");
+        let RedisEntry::OnDisk { id, size, .. } = entry.value().as_ref() else {
+            panic!("oldest large redis entry should have been spilled to disk");
+        };
+        assert_eq!(*size, big_size as u64);
+        let path = state.cache_path(*id);
+        assert!(path.exists(), "spilled redis value must exist on disk");
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk, big);
+
+        // The newest entry stays in memory.
+        let newest = state.redis_entries.get(b"newest".as_ref()).unwrap();
+        assert!(matches!(
+            newest.value().as_ref(),
+            RedisEntry::InMemory { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn redis_large_entries_dropped_when_disk_also_tight() {
+        // Same shape as the spill test but with a tiny disk budget: the
+        // spilled entry should immediately be reaped under disk pressure
+        // in the same eviction pass, so the oldest key disappears from
+        // the map entirely (and its on-disk file is unlinked).
+        let big_size = SNAPSHOT_INLINE_THRESHOLD + 1024;
+        let state = make_state((big_size as u64) * 4, 8, "redis-large-tight-disk");
+        let big = vec![b'x'; big_size];
+        insert_redis(state, b"oldest", &big, OLD);
+        insert_redis(state, b"older", &big, OLD + 1);
+        insert_redis(state, b"newer", &big, OLD + 2);
+        insert_redis(state, b"newest", &big, OLD + 3);
+        evict(state).await.unwrap();
+        // Give the spawn'd unlink from `remove_redis` a moment to run.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!state.redis_entries.contains_key(b"oldest".as_ref()));
         assert!(state.redis_entries.contains_key(b"newest".as_ref()));
+        // No leftover spill files for the dropped entry.
+        let files = list_blob_files(state);
+        assert!(
+            files.is_empty(),
+            "spilled-then-reaped redis files should be unlinked, got {files:?}"
+        );
     }
 
     #[tokio::test]
@@ -821,7 +930,7 @@ mod tests {
         insert_redis(state, b"k_med", &small, OLD + 1);
         insert_redis(state, b"k_new", &small, OLD + 2);
         insert_redis(state, b"k_now", &small, OLD + 3);
-        evict(state).await;
+        evict(state).await.unwrap();
         assert!(!state.redis_entries.contains_key(b"k_old".as_ref()));
         assert!(state.redis_entries.contains_key(b"k_now".as_ref()));
         // No file should have been written - small entries are never spilled.
@@ -852,7 +961,7 @@ mod tests {
                 last_accessed: AtomicU64::new(OLD),
             }),
         );
-        evict(state).await;
+        evict(state).await.unwrap();
         // Give the spawn'd unlink task a moment to run.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!state.redis_entries.contains_key(key.as_ref()));
@@ -870,7 +979,7 @@ mod tests {
         let manifest_body = manifest_body(&[&blob_digest]);
         insert_manifest_(state, manifest_body, OLD);
 
-        evict(state).await;
+        evict(state).await.unwrap();
 
         // The blob should have been demoted to OnDisk and the bytes written.
         let entry = state.blobs.get(&blob_digest).unwrap();
@@ -902,7 +1011,7 @@ mod tests {
         insert_manifest_(state, manifest_body, OLD);
 
         assert!(blob_path.exists());
-        evict(state).await;
+        evict(state).await.unwrap();
 
         assert!(!state.blobs.contains_key(&blob_digest));
         assert!(!blob_path.exists(), "on-disk blob file must be unlinked");
@@ -919,7 +1028,7 @@ mod tests {
         let manifest_body = manifest_body(&[&blob_digest]);
         let manifest_digest = insert_manifest_(state, manifest_body, OLD);
 
-        evict(state).await;
+        evict(state).await.unwrap();
 
         assert!(
             !state.manifests.contains_key(&manifest_digest),
@@ -945,7 +1054,7 @@ mod tests {
         let m1 = insert_manifest_(state, manifest_body(&[&blob_digest]), OLD);
         let m2 = insert_manifest_(state, manifest_body(&[&blob_digest]), OLD + 1);
 
-        evict(state).await;
+        evict(state).await.unwrap();
 
         // Both manifests are still in the cache (memory eviction only spills
         // their blobs; it does not delete manifests).
@@ -971,7 +1080,7 @@ mod tests {
         let manifest_body = manifest_body(&[&blob_digest]);
         insert_manifest_(state, manifest_body, OLD);
 
-        evict(state).await;
+        evict(state).await.unwrap();
 
         assert!(
             !state.blobs.contains_key(&blob_digest),

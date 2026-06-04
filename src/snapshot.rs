@@ -373,8 +373,9 @@ enum LoadError {
 
 /// Recompute all seven usage buckets from scratch by walking the live
 /// `manifests`, `blobs`, and `redis_entries` maps. Used by the snapshot
-/// loader (which inserts entries via the direct DashMap path) and at
-/// the end of every eviction pass, to keep the counters from drifting.
+/// loader and `wipe_cache`, both of which mutate the DashMaps directly
+/// instead of going through the `insert_*`/`remove_*` helpers that keep
+/// the counters in sync.
 fn recompute_usage(state: &State) {
     let mut manifest_mem = 0i64;
     let mut small_blob = 0i64;
@@ -401,13 +402,14 @@ fn recompute_usage(state: &State) {
         }
     }
     for r in state.redis_entries.iter() {
-        let key_len = r.key().len() as i64;
+        // Key always lives in memory regardless of where the value sits.
+        small_redis += r.key().len() as i64;
         match r.value().as_ref() {
             RedisEntry::InMemory { value, .. } if value.len() > MEMORY_TIER_THRESHOLD => {
-                large_redis += value.len() as i64 + key_len;
+                large_redis += value.len() as i64;
             }
             RedisEntry::InMemory { value, .. } => {
-                small_redis += value.len() as i64 + key_len;
+                small_redis += value.len() as i64;
             }
             RedisEntry::OnDisk { size, .. } => {
                 redis_disk += *size as i64;
