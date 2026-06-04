@@ -223,6 +223,13 @@ async fn handle_request_inner(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 put_blob_upload(state, req, upstream_host, name, uuid_str).await
             }
+            Method::DELETE => {
+                state
+                    .metrics
+                    .docker_blob_upload_delete
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                delete_blob_upload(state, upstream_host, name, uuid_str).await
+            }
             Method::GET => get_blob_upload_status(state, upstream_host, name, uuid_str).await,
             _ => Err(DockerError::MethodNotAllowed(req.method().clone())),
         }
@@ -936,6 +943,30 @@ async fn get_blob_upload_status(
         .header("Location", format!("/v2/self/{name}/blobs/uploads/{uuid}"))
         .header("Range", format!("0-{}", end.saturating_sub(1)))
         .header("Docker-Upload-UUID", uuid.to_string())
+        .body(empty())
+        .map_err(Into::into)
+}
+
+/// DELETE /v2/self/<name>/blobs/uploads/<uuid> - cancel a resumable upload.
+/// Per the OCI distribution spec this returns 204 No Content; clients such as
+/// buildah call it after a HEAD hit on the target blob or on any error path.
+async fn delete_blob_upload(
+    state: &'static State,
+    upstream_host: String,
+    name: String,
+    uuid_str: String,
+) -> Result<Response<ProxyBody>, DockerError> {
+    ensure_self(&upstream_host, &Method::DELETE)?;
+
+    let Ok(uuid) = Uuid::parse_str(&uuid_str) else {
+        return Ok(error_response(StatusCode::BAD_REQUEST, "invalid upload id"));
+    };
+    let removed = state.uploads.remove(&uuid).is_some();
+    debug!(%name, %uuid, removed, "blob upload cancelled");
+
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("Content-Length", "0")
         .body(empty())
         .map_err(Into::into)
 }

@@ -23,6 +23,7 @@ pub struct Metrics {
     pub docker_blob_upload_post: AlignedAtomicU64,
     pub docker_blob_upload_patch: AlignedAtomicU64,
     pub docker_blob_upload_put: AlignedAtomicU64,
+    pub docker_blob_upload_delete: AlignedAtomicU64,
 
     pub docker_auth_failures: AlignedAtomicU64,
     pub docker_upstream_requests: AlignedAtomicU64,
@@ -252,6 +253,12 @@ pub fn render(state: &State) -> String {
         "dockfoxprox_docker_blob_upload_put_total",
         "Blob upload sessions finalised (PUT).",
         m.docker_blob_upload_put.load(Relaxed),
+    );
+    counter(
+        &mut out,
+        "dockfoxprox_docker_blob_upload_delete_total",
+        "Blob upload sessions cancelled (DELETE).",
+        m.docker_blob_upload_delete.load(Relaxed),
     );
 
     counter(
