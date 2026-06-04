@@ -83,6 +83,7 @@ pub async fn handle_request(
     state: &'static State,
     req: Request<Incoming>,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let is_head = req.method() == Method::HEAD;
     match handle_request_inner(state, req).await {
         Ok(r) => Ok(r),
         Err(e) => match e {
@@ -99,7 +100,9 @@ pub async fn handle_request(
                     .expect("static response"));
             }
             DockerError::NotFound => {
-                warn!(error = %e, "not found");
+                if !is_head {
+                    warn!(error = %e, "not found");
+                }
                 return Ok(error_response(StatusCode::NOT_FOUND, "Not found"));
             }
             DockerError::InvalidHost(_) => {
