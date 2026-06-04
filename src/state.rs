@@ -201,6 +201,10 @@ impl State {
     /// Create a new `State` from the given configuration and reqwest client.
     /// This leaks the `State` so it can be safely shared as a `'static` reference across the application.
     pub fn new(config: Config, reqwest_client: Client) -> &'static Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let state = Box::leak(Box::new(Self {
             tokens: DashMap::new(),
             manifests: DashMap::new(),
@@ -209,7 +213,7 @@ impl State {
             uploads: DashMap::new(),
             config,
             reqwest_client,
-            now: AlignedAtomicU64::new(0),
+            now: AlignedAtomicU64::new(now),
             manifest_memory_usage: AlignedAtomicI64::new(0),
             small_blob_memory_usage: AlignedAtomicI64::new(0),
             large_blob_memory_usage: AlignedAtomicI64::new(0),
@@ -222,6 +226,15 @@ impl State {
             next_id: AlignedAtomicU64::new(0),
             eviction_notify: Notify::new(),
         }));
+        state
+            .metrics
+            .oldest_large_memory_touch_time
+            .store(now, Relaxed);
+        state
+            .metrics
+            .oldest_small_memory_touch_time
+            .store(now, Relaxed);
+        state.metrics.oldest_disk_touch_time.store(now, Relaxed);
 
         TaskBuilder::new("time updater")
             .main()

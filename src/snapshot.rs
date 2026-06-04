@@ -385,19 +385,29 @@ fn recompute_usage(state: &State) {
     let mut blob_disk = 0i64;
     let mut redis_disk = 0i64;
 
+    let now = state.now.load(Relaxed);
+    let mut oldest_small = u64::MAX;
+    let mut oldest_large = u64::MAX;
+    let mut oldest_disk = u64::MAX;
+
     for m in state.manifests.iter() {
         manifest_mem += m.value().content.len() as i64;
+        oldest_small = oldest_small.min(m.value().last_used.load(Relaxed));
     }
     for b in state.blobs.iter() {
+        let last_accessed = b.value().last_accessed().load(Relaxed);
         match b.value().as_ref() {
             Blob::InMemory { content, .. } if content.len() > MEMORY_TIER_THRESHOLD => {
                 large_blob += content.len() as i64;
+                oldest_large = oldest_large.min(last_accessed);
             }
             Blob::InMemory { content, .. } => {
                 small_blob += content.len() as i64;
+                oldest_small = oldest_small.min(last_accessed);
             }
             Blob::OnDisk { size, .. } => {
                 blob_disk += *size as i64;
+                oldest_disk = oldest_disk.min(last_accessed);
             }
         }
     }
@@ -405,14 +415,29 @@ fn recompute_usage(state: &State) {
         // Key always lives in memory regardless of where the value sits.
         small_redis += r.key().len() as i64;
         match r.value().as_ref() {
-            RedisEntry::InMemory { value, .. } if value.len() > MEMORY_TIER_THRESHOLD => {
+            RedisEntry::InMemory {
+                value,
+                last_accessed,
+                ..
+            } if value.len() > MEMORY_TIER_THRESHOLD => {
                 large_redis += value.len() as i64;
+                oldest_large = oldest_large.min(last_accessed.load(Relaxed));
             }
-            RedisEntry::InMemory { value, .. } => {
+            RedisEntry::InMemory {
+                value,
+                last_accessed,
+                ..
+            } => {
                 small_redis += value.len() as i64;
+                oldest_small = oldest_small.min(last_accessed.load(Relaxed));
             }
-            RedisEntry::OnDisk { size, .. } => {
+            RedisEntry::OnDisk {
+                size,
+                last_accessed,
+                ..
+            } => {
                 redis_disk += *size as i64;
+                oldest_disk = oldest_disk.min(last_accessed.load(Relaxed));
             }
         }
     }
@@ -424,6 +449,21 @@ fn recompute_usage(state: &State) {
     state.large_redis_memory_usage.store(large_redis, Relaxed);
     state.blob_disk_usage.store(blob_disk, Relaxed);
     state.redis_disk_usage.store(redis_disk, Relaxed);
+
+    // Empty pool -> publish `now` to match eviction's convention.
+    let fallback = |v: u64| if v == u64::MAX { now } else { v };
+    state
+        .metrics
+        .oldest_small_memory_touch_time
+        .store(fallback(oldest_small), Relaxed);
+    state
+        .metrics
+        .oldest_large_memory_touch_time
+        .store(fallback(oldest_large), Relaxed);
+    state
+        .metrics
+        .oldest_disk_touch_time
+        .store(fallback(oldest_disk), Relaxed);
 }
 
 async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
