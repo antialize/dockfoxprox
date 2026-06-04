@@ -19,6 +19,7 @@
 //! with the metadata that points at them.
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use anyhow::{Context, Result, anyhow};
@@ -27,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::digest::Digest;
-use crate::state::{Blob, Manifest, RedisEntry, State};
+use crate::state::{Blob, MEMORY_TIER_THRESHOLD, Manifest, RedisEntry, State};
 
 /// Bump this when the snapshot schema changes in a way that can't be handled
 /// by serde's `#[serde(default)]` forward-compatibility.
@@ -75,6 +76,7 @@ struct ManifestEntry {
     media_type: String,
     last_used: u64,
     content: Bytes,
+    evicted: bool,
 }
 
 /// Blobs in the snapshot are always disk-resident. In-memory blobs are
@@ -195,6 +197,7 @@ pub async fn save(state: &State) -> Result<()> {
             media_type: e.value().media_type.clone(),
             last_used: e.value().last_used.load(Relaxed),
             content: e.value().content.clone(),
+            evicted: e.value().evicted.load(Relaxed),
         })
         .collect();
 
@@ -368,6 +371,59 @@ enum LoadError {
     Other(anyhow::Error),
 }
 
+/// Recompute all seven usage buckets from scratch by walking the live
+/// `manifests`, `blobs`, and `redis_entries` maps. Used by the snapshot
+/// loader (which inserts entries via the direct DashMap path) and at
+/// the end of every eviction pass, to keep the counters from drifting.
+fn recompute_usage(state: &State) {
+    let mut manifest_mem = 0i64;
+    let mut small_blob = 0i64;
+    let mut large_blob = 0i64;
+    let mut small_redis = 0i64;
+    let mut large_redis = 0i64;
+    let mut blob_disk = 0i64;
+    let mut redis_disk = 0i64;
+
+    for m in state.manifests.iter() {
+        manifest_mem += m.value().content.len() as i64;
+    }
+    for b in state.blobs.iter() {
+        match b.value().as_ref() {
+            Blob::InMemory { content, .. } if content.len() > MEMORY_TIER_THRESHOLD => {
+                large_blob += content.len() as i64;
+            }
+            Blob::InMemory { content, .. } => {
+                small_blob += content.len() as i64;
+            }
+            Blob::OnDisk { size, .. } => {
+                blob_disk += *size as i64;
+            }
+        }
+    }
+    for r in state.redis_entries.iter() {
+        let key_len = r.key().len() as i64;
+        match r.value().as_ref() {
+            RedisEntry::InMemory { value, .. } if value.len() > MEMORY_TIER_THRESHOLD => {
+                large_redis += value.len() as i64 + key_len;
+            }
+            RedisEntry::InMemory { value, .. } => {
+                small_redis += value.len() as i64 + key_len;
+            }
+            RedisEntry::OnDisk { size, .. } => {
+                redis_disk += *size as i64;
+            }
+        }
+    }
+
+    state.manifest_memory_usage.store(manifest_mem, Relaxed);
+    state.small_blob_memory_usage.store(small_blob, Relaxed);
+    state.large_blob_memory_usage.store(large_blob, Relaxed);
+    state.small_redis_memory_usage.store(small_redis, Relaxed);
+    state.large_redis_memory_usage.store(large_redis, Relaxed);
+    state.blob_disk_usage.store(blob_disk, Relaxed);
+    state.redis_disk_usage.store(redis_disk, Relaxed);
+}
+
 async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
     let buf = match tokio::fs::read(path).await {
         Ok(b) => b,
@@ -388,20 +444,18 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
     }
 
     let mut stats = LoadStats::default();
-    let mut memory_usage: u64 = 0;
-    let mut disk_usage: u64 = 0;
 
     for m in snap.manifests {
         let Ok(d) = m.digest.parse::<Digest>() else {
             continue;
         };
-        memory_usage += m.content.len() as u64;
         state.manifests.insert(
             d,
             Arc::new(Manifest {
                 content: m.content,
                 media_type: m.media_type,
                 last_used: AtomicU64::new(m.last_used),
+                evicted: AtomicBool::new(m.evicted),
             }),
         );
         stats.manifests += 1;
@@ -414,7 +468,6 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
         // Small blobs are inlined directly in the snapshot; restore them as
         // in-memory entries without touching the disk.
         if let Some(content) = b.content {
-            memory_usage += content.len() as u64;
             state.blobs.insert(
                 d,
                 Arc::new(Blob::InMemory {
@@ -432,7 +485,6 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
         let on_disk = tokio::fs::metadata(&path).await.ok();
         match on_disk {
             Some(meta) if meta.len() == b.size => {
-                disk_usage += b.size;
                 state.blobs.insert(
                     d,
                     Arc::new(Blob::OnDisk {
@@ -460,7 +512,6 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
 
     for r in snap.redis_entries {
         if let Some(value) = r.value {
-            memory_usage += r.key.len() as u64 + value.len() as u64;
             state.redis_entries.insert(
                 r.key,
                 Arc::new(RedisEntry::InMemory {
@@ -470,7 +521,6 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
                 }),
             );
         } else {
-            disk_usage += r.size;
             state.redis_entries.insert(
                 r.key,
                 Arc::new(RedisEntry::OnDisk {
@@ -483,8 +533,7 @@ async fn load(state: &State, path: &PathBuf) -> Result<LoadStats, LoadError> {
         stats.redis_entries += 1;
     }
 
-    state.approx_memory_usage.store(memory_usage, Relaxed);
-    state.disk_usage.store(disk_usage, Relaxed);
+    recompute_usage(state);
     state.next_id.store(snap.next_id, Relaxed);
     Ok(stats)
 }
@@ -501,7 +550,6 @@ async fn wipe_cache(state: &State) {
     state.manifests.clear();
     state.tags.clear();
     state.redis_entries.clear();
-    state.approx_memory_usage.store(0, Relaxed);
-    state.disk_usage.store(0, Relaxed);
+    recompute_usage(state);
     state.next_id.store(0, Relaxed);
 }

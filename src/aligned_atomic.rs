@@ -1,7 +1,10 @@
 //! An aligned atomic u64, on a cache line boundary to avoid false sharing
 //! with other atomics in the `State`. `align(64)` alone is enough: the
 //! compiler inserts tail padding so the struct is a full cache line.
-use std::{ops::Deref, sync::atomic::AtomicU64};
+use std::{
+    ops::Deref,
+    sync::atomic::{AtomicI64, AtomicU64},
+};
 
 #[derive(Default, Debug)]
 #[repr(C, align(64))]
@@ -20,6 +23,29 @@ const _: () = assert!(std::mem::size_of::<AlignedAtomicU64>() == 64);
 
 impl Deref for AlignedAtomicU64 {
     type Target = AtomicU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Default, Debug)]
+#[repr(C, align(64))]
+pub struct AlignedAtomicI64(AtomicI64);
+
+impl AlignedAtomicI64 {
+    /// Create a new `AlignedAtomicI64` with the given initial value.
+    pub fn new(val: i64) -> Self {
+        Self(AtomicI64::new(val))
+    }
+}
+
+// Guard against future fields silently doubling the size by overflowing the
+// 64-byte cache line.
+const _: () = assert!(std::mem::size_of::<AlignedAtomicI64>() == 64);
+
+impl Deref for AlignedAtomicI64 {
+    type Target = AtomicI64;
 
     fn deref(&self) -> &Self::Target {
         &self.0

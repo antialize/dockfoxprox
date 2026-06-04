@@ -47,22 +47,18 @@ pub struct Metrics {
 
     // -- Usage breakdown (refreshed only by the eviction pass) ---------------
     //
-    // These four bytes gauges and two `oldest_*_touch_time` gauges are
-    // populated at the end of every `evict()` call from the numbers it
-    // already collects. Between passes they may lag reality (we don't
-    // bother subtracting when something is removed by a non-eviction code
-    // path) - the same trade-off `disk_usage` has always made.
-    pub memory_usage_docker_bytes: AlignedAtomicU64,
-    pub memory_usage_redis_bytes: AlignedAtomicU64,
-    pub disk_usage_docker_bytes: AlignedAtomicU64,
-    pub disk_usage_redis_bytes: AlignedAtomicU64,
-    /// Unix seconds. Oldest `last_accessed` across items charged to the
-    /// memory budget (large in-memory blobs, manifests, large in-memory
-    /// redis values). 0 means "no such item observed".
-    pub oldest_memory_touch_time: AlignedAtomicU64,
-    /// Unix seconds. Oldest `last_accessed` across items charged to the
-    /// disk budget (on-disk blobs, small in-memory blobs, on-disk + small
-    /// in-memory redis values). 0 means "no such item observed".
+    // The seven bytes-per-bucket gauges live on `State` and are updated
+    // incrementally on every insert/remove, so they're always live. The
+    // three `oldest_*_touch_time` gauges below are snapshots taken at
+    // the end of every `evict()` and may lag reality between passes.
+    /// Unix seconds. Oldest `last_accessed` across small-pool items
+    /// (manifests, small in-memory blobs, small in-memory redis). 0 = none.
+    pub oldest_small_memory_touch_time: AlignedAtomicU64,
+    /// Unix seconds. Oldest `last_accessed` across large-pool items
+    /// (large in-memory blobs, large in-memory redis). 0 = none.
+    pub oldest_large_memory_touch_time: AlignedAtomicU64,
+    /// Unix seconds. Oldest `last_accessed` across disk-pool items
+    /// (on-disk blobs, on-disk redis). 0 = none.
     pub oldest_disk_touch_time: AlignedAtomicU64,
 }
 
@@ -71,65 +67,107 @@ pub fn render(state: &State) -> String {
     let m = &state.metrics;
     let mut out = String::with_capacity(4096);
 
-    // Gauges sourced from the existing counters on `State`.
+    // Gauges sourced from the live bucket counters on `State`. These are
+    // maintained incrementally on every insert/remove plus reconciled at
+    // the end of every eviction pass.
     gauge(
         &mut out,
         "dockfoxprox_memory_usage_bytes",
-        "Approximate in-memory cache size (blobs + manifests + redis entries).",
-        state.approx_memory_usage.load(Relaxed),
+        "Total in-memory cache size (manifests + blobs + redis entries).",
+        state.total_memory_usage().max(0) as u64,
+    );
+    gauge(
+        &mut out,
+        "dockfoxprox_small_memory_usage_bytes",
+        "Small-pool memory usage (manifests + small blobs + small redis entries).",
+        state.small_memory_usage().max(0) as u64,
+    );
+    gauge(
+        &mut out,
+        "dockfoxprox_large_memory_usage_bytes",
+        "Large-pool memory usage (large in-memory blobs + large redis entries).",
+        state.large_memory_usage().max(0) as u64,
     );
     gauge(
         &mut out,
         "dockfoxprox_disk_usage_bytes",
-        "Approximate on-disk blob cache size.",
-        state.disk_usage.load(Relaxed),
+        "Total on-disk cache size (blobs + redis entries).",
+        state.total_disk_usage().max(0) as u64,
     );
-    // Per-component breakdown. Refreshed only by `eviction::evict`; stale
-    // between runs.
+    // Per-bucket breakdown of all seven mutually-exclusive accounting buckets.
     gauge(
         &mut out,
-        "dockfoxprox_memory_usage_docker_bytes",
-        "Memory budget consumed by docker blobs and manifests (last eviction pass).",
-        m.memory_usage_docker_bytes.load(Relaxed),
-    );
-    gauge(
-        &mut out,
-        "dockfoxprox_memory_usage_redis_bytes",
-        "Memory budget consumed by the redis-protocol cache (last eviction pass).",
-        m.memory_usage_redis_bytes.load(Relaxed),
+        "dockfoxprox_manifest_memory_usage_bytes",
+        "Bytes of manifest content held in memory.",
+        state.manifest_memory_usage.load(Relaxed).max(0) as u64,
     );
     gauge(
         &mut out,
-        "dockfoxprox_disk_usage_docker_bytes",
-        "Disk budget consumed by docker blobs (last eviction pass).",
-        m.disk_usage_docker_bytes.load(Relaxed),
+        "dockfoxprox_small_blob_memory_usage_bytes",
+        "Bytes of small in-memory blob content (at or below the small/large threshold).",
+        state.small_blob_memory_usage.load(Relaxed).max(0) as u64,
     );
     gauge(
         &mut out,
-        "dockfoxprox_disk_usage_redis_bytes",
-        "Disk budget consumed by the redis-protocol cache (last eviction pass).",
-        m.disk_usage_redis_bytes.load(Relaxed),
+        "dockfoxprox_large_blob_memory_usage_bytes",
+        "Bytes of large in-memory blob content (above the small/large threshold).",
+        state.large_blob_memory_usage.load(Relaxed).max(0) as u64,
     );
-    // Oldest touch-time across each tier. Small in-memory items are
-    // grouped with disk (they're cheap to delete; we don't move them to
-    // actual disk). 0 means no items in the tier at the last eviction.
     gauge(
         &mut out,
-        "dockfoxprox_oldest_memory_touch_time_seconds",
-        "Unix time of the oldest last_accessed across memory-tier items (0 if none).",
-        m.oldest_memory_touch_time.load(Relaxed),
+        "dockfoxprox_small_redis_memory_usage_bytes",
+        "Bytes of small in-memory redis entries (key + value, value at or below the threshold).",
+        state.small_redis_memory_usage.load(Relaxed).max(0) as u64,
+    );
+    gauge(
+        &mut out,
+        "dockfoxprox_large_redis_memory_usage_bytes",
+        "Bytes of large in-memory redis entries (key + value, value above the threshold).",
+        state.large_redis_memory_usage.load(Relaxed).max(0) as u64,
+    );
+    gauge(
+        &mut out,
+        "dockfoxprox_blob_disk_usage_bytes",
+        "Bytes of blob content stored on disk.",
+        state.blob_disk_usage.load(Relaxed).max(0) as u64,
+    );
+    gauge(
+        &mut out,
+        "dockfoxprox_redis_disk_usage_bytes",
+        "Bytes of redis-protocol entries stored on disk.",
+        state.redis_disk_usage.load(Relaxed).max(0) as u64,
+    );
+    // Oldest touch-time across each pool. 0 means no items in that pool
+    // at the most recent eviction pass.
+    gauge(
+        &mut out,
+        "dockfoxprox_oldest_small_memory_touch_time_seconds",
+        "Unix time of the oldest last_accessed across small-pool items (0 if none).",
+        m.oldest_small_memory_touch_time.load(Relaxed),
+    );
+    gauge(
+        &mut out,
+        "dockfoxprox_oldest_large_memory_touch_time_seconds",
+        "Unix time of the oldest last_accessed across large-pool items (0 if none).",
+        m.oldest_large_memory_touch_time.load(Relaxed),
     );
     gauge(
         &mut out,
         "dockfoxprox_oldest_disk_touch_time_seconds",
-        "Unix time of the oldest last_accessed across disk-tier items (0 if none).",
+        "Unix time of the oldest last_accessed across disk-pool items (0 if none).",
         m.oldest_disk_touch_time.load(Relaxed),
     );
     gauge(
         &mut out,
         "dockfoxprox_memory_limit_bytes",
-        "Configured memory budget.",
+        "Configured total memory budget.",
         state.config.memory_limit.0,
+    );
+    gauge(
+        &mut out,
+        "dockfoxprox_small_memory_limit_bytes",
+        "Configured small-pool reservation within the memory budget.",
+        state.config.small_memory_limit(),
     );
     gauge(
         &mut out,

@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::task::{Context as TaskContext, Poll};
 
 use crate::config::DockerRegistry;
@@ -334,6 +334,7 @@ async fn get_head_manifest(
     if let Some(entry) = state.manifests.get(&digest) {
         let now = state.now.load(Ordering::Relaxed);
         entry.last_used.store(now, Ordering::Relaxed);
+        entry.evicted.store(false, Ordering::Relaxed);
         state
             .metrics
             .docker_manifest_cache_hit
@@ -386,6 +387,7 @@ async fn get_head_manifest(
         content: body,
         media_type,
         last_used: AtomicU64::new(now),
+        evicted: AtomicBool::new(false),
     });
     state.insert_manifest(digest.clone(), entry.clone());
 
@@ -723,6 +725,7 @@ async fn put_manifest(
         content: Bytes::from(body),
         media_type: content_type,
         last_used: AtomicU64::new(now),
+        evicted: AtomicBool::new(false),
     });
     let len = manifest.content.len();
     state.insert_manifest(digest.clone(), manifest);

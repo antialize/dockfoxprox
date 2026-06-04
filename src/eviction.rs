@@ -1,17 +1,16 @@
 use std::{
-    collections::HashMap,
+    collections::{BinaryHeap, HashMap},
     path::PathBuf,
     sync::{Arc, atomic::AtomicU64},
 };
 
 use bytes::Bytes;
 use tokio_tasks::{RunToken, cancelable};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::{
     digest::Digest,
-    snapshot::SNAPSHOT_INLINE_THRESHOLD,
-    state::{Blob, RedisEntry, State},
+    state::{Blob, MEMORY_TIER_THRESHOLD, RedisEntry, State},
 };
 
 /// Blobs younger than this are never deleted by eviction. Covers the
@@ -76,405 +75,448 @@ async fn delete_disk_blob(state: &State, id: u64) {
 
 /// One full eviction pass.
 ///
-/// Strategy (run in order until under both budgets):
-///   1. Drop the oldest disk-tier manifest if `disk_usage > disk_target`,
-///      cascading to its blobs whose refcount falls to zero.
-///   2. Pick the oldest memory-tier item (manifest or redis entry) and
-///      reclaim it: manifests get demoted to disk-tier (their blobs spilled
-///      to disk); redis entries are removed outright.
-///   3. Sweep unreferenced blobs (older than `BLOB_GRACE_SECONDS`).
+/// Three budgets are enforced, in priority order:
+///
+///   * **Small pool** (`small_memory_limit`): the sum of in-memory small
+///     items - manifests, small blobs, small redis entries - must fit
+///     under the small reservation. Freed by dropping whole manifests
+///     (cascading to their referenced blobs) or dropping small redis
+///     entries.
+///   * **Total memory** (`memory_limit`): the sum of every in-memory item
+///     must fit under the total memory budget. The "large pool" is just
+///     `memory_limit - small_used`; there is no fixed large reservation.
+///     Freed by spilling a memory-tier manifest's large blobs to disk
+///     (the manifest itself stays cached) or by dropping large redis
+///     entries. If the small pool overruns and cannot be reduced, large
+///     blobs will eventually get spilled to keep the total under budget.
+///   * **Disk** (`disk_limit`): on-disk blobs plus on-disk redis entries
+///     must fit. Freed by dropping a disk-tier manifest (cascading) or an
+///     on-disk redis entry.
+///
+/// All three checks share a single eviction loop: each iteration picks
+/// the most-overrun budget, pops the oldest candidate eligible for that
+/// budget, and either drops (manifests + redis) or spills (large blobs of
+/// a memory-tier manifest). A manifest may appear in more than one
+/// candidate heap; the heaps are independent and stale entries are
+/// skipped on pop.
+///
+/// After the loop, a final sweep deletes any blobs whose refcount fell
+/// to zero (provided they're outside `BLOB_GRACE_SECONDS`).
 pub(crate) async fn evict(state: &'static State) {
     use std::sync::atomic::Ordering::Relaxed;
 
     state.metrics.eviction_runs.fetch_add(1, Relaxed);
-
-    // Reclaming memory from eviction is a balancing act. We want to evict enough to get back under the limit,
-    // but evicting just barely enough means we'll likely have to run eviction
-    let memory_target = state.config.memory_limit.0 - state.config.memory_limit.0 / 4;
-
-    // Per-blob bookkeeping: (in_memory, size, disk_refs, memory_refs, last_accessed).
-    //
-    // `in_memory` here means "counts toward the memory budget AND is eligible
-    // to be spilled to disk under memory pressure". Small `Blob::InMemory`
-    // entries (<= SNAPSHOT_INLINE_THRESHOLD) are intentionally classified as
-    // `in_memory = false`: writing them out as tiny files is wasteful, so we
-    // instead account their bytes against `disk_usage` and let the disk-tier
-    // manifest eviction path delete them in place when they age out.
-    let mut disk_usage: u64 = 0;
-    let mut memory_usage: u64 = 0;
-    // Per-component breakdown and per-tier oldest touch-time, observed at
-    // the start of this pass. We don't try to keep these accurate as items
-    // get evicted below - we just snapshot them onto `state.metrics` at the
-    // very end. `u64::MAX` is the "no items observed" sentinel for oldest.
-    let mut memory_docker_bytes: u64 = 0;
-    let mut memory_redis_bytes: u64 = 0;
-    let mut disk_docker_bytes: u64 = 0;
-    let mut disk_redis_bytes: u64 = 0;
-    let mut oldest_memory: u64 = u64::MAX;
-    let mut oldest_disk: u64 = u64::MAX;
-    let mut blobs: HashMap<Digest, (bool, u64, u32, u32, u64)> = HashMap::new();
-    for blob in state.blobs.iter() {
-        let last_accessed = blob.value().last_accessed().load(Relaxed);
-        let (in_memory, size) = match blob.value().as_ref() {
-            Blob::InMemory { content, .. } if content.len() > SNAPSHOT_INLINE_THRESHOLD => {
-                memory_usage += content.len() as u64;
-                memory_docker_bytes += content.len() as u64;
-                oldest_memory = oldest_memory.min(last_accessed);
-                (true, content.len() as u64)
-            }
-            Blob::InMemory { content, .. } => {
-                // Small in-memory blob: treat as virtually on-disk.
-                disk_usage += content.len() as u64;
-                disk_docker_bytes += content.len() as u64;
-                oldest_disk = oldest_disk.min(last_accessed);
-                (false, content.len() as u64)
-            }
-            Blob::OnDisk { size, .. } => {
-                disk_usage += *size;
-                disk_docker_bytes += *size;
-                oldest_disk = oldest_disk.min(last_accessed);
-                (false, *size)
-            }
-        };
-        blobs.insert(blob.key().clone(), (in_memory, size, 0, 0, last_accessed));
-    }
-
-    // Manifests classified by whether any of their blobs is already on disk.
-    let mut disk_manifests: Vec<(u64, Digest)> = Vec::new();
-    let mut memory_manifests: Vec<(u64, Digest)> = Vec::new();
-    for manifest in state.manifests.iter() {
-        let digest = manifest.key();
-        let content = &manifest.value().content;
-        memory_usage += content.len() as u64;
-        memory_docker_bytes += content.len() as u64;
-        let last_used = manifest.value().last_used.load(Relaxed);
-        oldest_memory = oldest_memory.min(last_used);
-        let mut on_disk = false;
-        for r in referenced_digests(content) {
-            if let Some((in_memory, _size, disk_refs, memory_refs, _last)) = blobs.get_mut(&r) {
-                if *in_memory {
-                    *memory_refs += 1;
-                } else {
-                    *disk_refs += 1;
-                }
-                on_disk |= !*in_memory;
-            } else {
-                // Referenced blob not in cache - likely a foreign layer or
-                // already evicted by another manifest in this same pass.
-                debug!(%digest, %r, "manifest references missing blob");
-            }
-        }
-        let last_used = manifest.value().last_used.load(Relaxed);
-        if on_disk {
-            disk_manifests.push((last_used, digest.clone()));
-        } else {
-            memory_manifests.push((last_used, digest.clone()));
-        }
-    }
-
-    let mut disk_redis_entries = Vec::new();
-    let mut memory_redis_entries = Vec::new();
-    for entry in &state.redis_entries {
-        match entry.value().as_ref() {
-            RedisEntry::InMemory {
-                value,
-                last_accessed,
-                ..
-            } if value.len() > SNAPSHOT_INLINE_THRESHOLD => {
-                let bytes = value.len() as u64 + entry.key().len() as u64;
-                memory_usage += bytes;
-                memory_redis_bytes += bytes;
-                let t = last_accessed.load(Relaxed);
-                oldest_memory = oldest_memory.min(t);
-                memory_redis_entries.push((t, entry.key().clone(), value.len() as u64));
-            }
-            RedisEntry::InMemory {
-                value,
-                last_accessed,
-                ..
-            } => {
-                // Small in-memory redis entry: too small to be worth spilling
-                // to disk under memory pressure. Account it against the disk
-                // budget so the disk-tier eviction path ages it out.
-                let bytes = value.len() as u64 + entry.key().len() as u64;
-                disk_usage += bytes;
-                disk_redis_bytes += bytes;
-                let t = last_accessed.load(Relaxed);
-                oldest_disk = oldest_disk.min(t);
-                disk_redis_entries.push((t, entry.key().clone(), bytes));
-            }
-            RedisEntry::OnDisk {
-                last_accessed,
-                size,
-                ..
-            } => {
-                disk_usage += size;
-                disk_redis_bytes += size;
-                let t = last_accessed.load(Relaxed);
-                oldest_disk = oldest_disk.min(t);
-                // Push the on-disk byte count so the eviction loop below
-                // subtracts the right amount from `disk_usage` when this
-                // entry is reclaimed.
-                disk_redis_entries.push((t, entry.key().clone(), *size));
-            }
-        }
-    }
-
-    // Sort newest first; we `pop()` the oldest from the back.
-    disk_manifests.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
-    memory_manifests.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
-    disk_redis_entries.sort_by_key(|(t, _, _)| std::cmp::Reverse(*t));
-    memory_redis_entries.sort_by_key(|(t, _, _)| std::cmp::Reverse(*t));
-
-    // Evict more aggressively than strictly necessary so we don't thrash on
-    // every insert when we're hovering near the limit.
-    let disk_target = state.config.disk_limit.0 - state.config.disk_limit.0 / 4;
     let now = state.now.load(Relaxed);
 
-    loop {
-        if disk_usage > disk_target {
-            if let Some((time, key, size)) = disk_redis_entries.last()
-                && disk_manifests
-                    .last()
-                    .map(|(t, _)| *t > *time)
-                    .unwrap_or(true)
-            {
-                if state.remove_redis(key) {
-                    disk_usage = disk_usage.saturating_sub(*size);
-                    state.metrics.eviction_redis_entries.fetch_add(1, Relaxed);
-                }
-                disk_redis_entries.pop();
-                continue;
-            }
-            if let Some((_, victim)) = disk_manifests.pop() {
-                // Drop the oldest disk-tier manifest entirely. Any blob whose
-                // refcount falls to zero is removed from the cache (and its file
-                // deleted if on disk).
-                let Some((_, m)) = state.manifests.remove(&victim) else {
-                    continue;
-                };
-                state
-                    .metrics
-                    .eviction_manifests_deleted
-                    .fetch_add(1, Relaxed);
-                memory_usage = memory_usage.saturating_sub(m.content.len() as u64);
+    let mut small_blob_memory = 0;
+    let mut large_blob_memory = 0;
+    let mut blob_disk = 0;
+    let mut small_redis_memory = 0;
+    let mut large_redis_memory = 0;
+    let mut redis_disk = 0;
+    let mut manifest_memory = 0;
 
-                for r in referenced_digests(&m.content) {
-                    let Some(entry) = blobs.get_mut(&r) else {
-                        continue;
-                    };
-                    let (in_memory, _size, disk_refs, memory_refs, last_accessed) = entry;
-                    if *in_memory {
-                        *memory_refs = memory_refs.saturating_sub(1);
-                    } else {
-                        *disk_refs = disk_refs.saturating_sub(1);
-                    }
-                    if *disk_refs != 0 || *memory_refs != 0 {
-                        continue;
-                    }
-                    if now.saturating_sub(*last_accessed) < BLOB_GRACE_SECONDS {
-                        continue;
-                    }
-                    // Snapshot which budget this blob was charged to before
-                    // we move it out of the bookkeeping map.
-                    let booked_in_memory = *in_memory;
-                    if let Some((_, b)) = state.blobs.remove(&r) {
-                        state.metrics.eviction_blobs_deleted.fetch_add(1, Relaxed);
-                        match b.as_ref() {
-                            Blob::InMemory { content, .. } => {
-                                let bytes = content.len() as u64;
-                                if booked_in_memory {
-                                    memory_usage = memory_usage.saturating_sub(bytes);
-                                } else {
-                                    // Small in-memory blob accounted as disk.
-                                    disk_usage = disk_usage.saturating_sub(bytes);
-                                }
-                            }
-                            Blob::OnDisk { size, id, .. } => {
-                                disk_usage = disk_usage.saturating_sub(*size);
-                                delete_disk_blob(state, *id).await;
-                            }
-                        }
-                    }
-                }
-                state.tags.retain(|_, d| d != &victim);
-                info!(%victim, memory_usage, disk_usage, "evicted disk-tier manifest");
-                continue;
-            }
-        }
-
-        if memory_usage < memory_target {
-            break;
-        }
-
-        if let Some((time, key, size)) = memory_redis_entries.last()
-            && memory_manifests
-                .last()
-                .map(|(t, _)| *t > *time)
-                .unwrap_or(true)
-        {
-            if state.remove_redis(key) {
-                memory_usage = memory_usage.saturating_sub(*size);
-                state.metrics.eviction_redis_entries.fetch_add(1, Relaxed);
-            }
-            memory_redis_entries.pop();
-            continue;
-        }
-
-        let Some((_, victim)) = memory_manifests.pop() else {
-            break;
-        };
-
-        // Push the oldest fully-in-memory manifest's blobs to disk. The
-        // manifest itself stays cached; it just gets reclassified.
-        let Some(m) = state.manifests.get(&victim).map(|e| e.clone()) else {
-            continue;
-        };
-        let refs = referenced_digests(&m.content);
-        let mut moved = 0u64;
-        for r in refs {
-            let Some(entry) = blobs.get_mut(&r) else {
-                continue;
-            };
-            let (in_memory, size, disk_refs, memory_refs, _last) = entry;
-            if !*in_memory {
-                continue;
-            }
-            // We're evicting `victim` from the in-memory set, so its
-            // reference no longer counts towards keeping the blob in RAM.
-            *memory_refs = memory_refs.saturating_sub(1);
-            // Other in-memory manifests still reference this blob so leave
-            // it in RAM so they don't have to hit disk.
-            if *memory_refs > 0 {
-                continue;
-            }
-            let Some(cur) = state.blobs.get(&r).map(|e| e.clone()) else {
-                continue;
-            };
-            let Blob::InMemory {
-                content,
-                media_type,
-                last_accessed,
-                id,
-            } = cur.as_ref()
-            else {
-                continue;
-            };
-            let path = match write_blob_to_disk(state, *id, content).await {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(digest=%r, error=%e, "failed to write blob to disk; keeping in memory");
-                    continue;
-                }
-            };
-            let on_disk = Arc::new(Blob::OnDisk {
-                size: *size,
-                media_type: media_type.clone(),
-                last_accessed: AtomicU64::new(last_accessed.load(Relaxed)),
-                id: *id,
-            });
-            state.blobs.insert(r.clone(), on_disk);
-            state.metrics.eviction_blobs_to_disk.fetch_add(1, Relaxed);
-            memory_usage = memory_usage.saturating_sub(*size);
-            disk_usage += *size;
-            moved += *size;
-            *in_memory = false;
-            // Victim still lives in `state.manifests` and now references an
-            // on-disk blob; record that as a disk-ref so the unreferenced
-            // sweep below doesn't immediately delete the blob we just spilled.
-            *disk_refs = disk_refs.saturating_add(1);
-            debug!(digest=%r, bytes=*size, path=%path.display(), "blob moved to disk");
-        }
-        // We do not put stuff into disk manifests here, so we don't have to resort
-        // We can live with more data on disk until the next eviction pass.
-        info!(%victim, bytes_moved=moved, memory_usage, disk_usage, "pushed memory manifest to disk");
+    enum EvictionCandidate {
+        Manifest {
+            last_accesses: u64,
+            digest: Digest,
+        },
+        Redis {
+            key: Bytes,
+            last_accessed: u64,
+            size: u64,
+        },
     }
 
-    // Find unreferenced blobs and remove them from the cache (and disk if applicable).
-    // Blobs within the grace window are left alone - they may be a freshly
-    // uploaded blob whose manifest hasn't been PUT yet, or a blob a client just
-    // HEAD-probed before pushing a referring manifest.
-    for (digest, (in_memory, _, disk_refs, memory_refs, last_accessed)) in &blobs {
-        if *disk_refs != 0 || *memory_refs != 0 {
-            continue;
+    impl EvictionCandidate {
+        fn last_access_time(&self) -> u64 {
+            match self {
+                EvictionCandidate::Manifest { last_accesses, .. } => *last_accesses,
+                EvictionCandidate::Redis { last_accessed, .. } => *last_accessed,
+            }
         }
-        if now.saturating_sub(*last_accessed) < BLOB_GRACE_SECONDS {
-            continue;
+    }
+
+    impl PartialEq for EvictionCandidate {
+        fn eq(&self, other: &Self) -> bool {
+            self.last_access_time() == other.last_access_time()
         }
-        if let Some((_, b)) = state.blobs.remove(digest) {
+    }
+    impl Eq for EvictionCandidate {}
+    /// Compare newest first so the BinaryHeap pops the oldest candidate.
+    impl Ord for EvictionCandidate {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            other.last_access_time().cmp(&self.last_access_time())
+        }
+    }
+    impl PartialOrd for EvictionCandidate {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut small_memory_candidates = BinaryHeap::new();
+    let mut large_memory_candidates = BinaryHeap::new();
+    let mut disk_candidates = BinaryHeap::new();
+
+    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+    enum BlobTier {
+        SmallMem,
+        LargeMem,
+        Disk,
+    }
+
+    /// Per-blob bookkeeping for a single eviction pass.
+    struct BlobBk {
+        tier: BlobTier,
+        refs: u32,
+        unevicted_refs: u32,
+        last_accessed: u64,
+    }
+
+    // We do not reap blobs directly, instead manifests
+    // can be evicted or spilled, and the blobs they reference are decref'd and
+    let mut blobs: HashMap<Digest, BlobBk> = HashMap::with_capacity(state.blobs.len());
+    for b in state.blobs.iter() {
+        let last_accessed = b.value().last_accessed().load(Relaxed);
+        let (tier, size) = match b.value().as_ref() {
+            Blob::InMemory { content, .. } if content.len() > MEMORY_TIER_THRESHOLD => {
+                (BlobTier::LargeMem, content.len() as u64)
+            }
+            Blob::InMemory { content, .. } => (BlobTier::SmallMem, content.len() as u64),
+            Blob::OnDisk { size, .. } => (BlobTier::Disk, *size),
+        };
+        match tier {
+            BlobTier::SmallMem => small_blob_memory += size,
+            BlobTier::LargeMem => large_blob_memory += size,
+            BlobTier::Disk => blob_disk += size,
+        }
+        blobs.insert(
+            b.key().clone(),
+            BlobBk {
+                tier,
+                refs: 0,
+                unevicted_refs: 0,
+                last_accessed,
+            },
+        );
+    }
+
+    for m in state.manifests.iter() {
+        let content = &m.value().content;
+        let size = content.len() as u64;
+        let last_used = m.value().last_used.load(Relaxed);
+        let refs = referenced_digests(content);
+        let mut some_in_large_memory = false;
+        let mut some_on_disk = false;
+        let evicted = m.value().evicted.load(Relaxed);
+        for r in &refs {
+            if let Some(bb) = blobs.get_mut(r) {
+                bb.refs += 1;
+                if !evicted {
+                    bb.unevicted_refs += 1;
+                }
+                some_on_disk |= bb.tier == BlobTier::Disk;
+                some_in_large_memory |= bb.tier == BlobTier::LargeMem;
+            } else {
+                debug!(digest=%m.key(), %r, "manifest references missing blob");
+            }
+        }
+        // We can always evict a manifest completely
+        small_memory_candidates.push(EvictionCandidate::Manifest {
+            last_accesses: last_used,
+            digest: m.key().clone(),
+        });
+        // If a manifest references any large-memory blobs, it can be spilled to disk under large-pool pressure; if so, track it as a candidate.
+        if some_in_large_memory {
+            large_memory_candidates.push(EvictionCandidate::Manifest {
+                last_accesses: last_used,
+                digest: m.key().clone(),
+            });
+        }
+        // If a manifest references any on-disk blobs, it can be dropped under disk-pool pressure; if so, track it as a candidate.
+        if some_on_disk {
+            disk_candidates.push(EvictionCandidate::Manifest {
+                last_accesses: last_used,
+                digest: m.key().clone(),
+            });
+        }
+        manifest_memory += size;
+    }
+
+    for e in state.redis_entries.iter() {
+        // We always keep the key in memory, so count its size against the memory pools.
+        small_redis_memory += e.key().len() as u64;
+        match e.value().as_ref() {
+            RedisEntry::InMemory {
+                value,
+                last_accessed,
+                id,
+            } if value.len() > MEMORY_TIER_THRESHOLD => {
+                large_memory_candidates.push(EvictionCandidate::Redis {
+                    key: e.key().clone(),
+                    last_accessed: last_accessed.load(Relaxed),
+                    size: value.len() as u64,
+                });
+                large_redis_memory += value.len() as u64;
+            }
+            RedisEntry::InMemory {
+                value,
+                last_accessed,
+                ..
+            } => {
+                small_memory_candidates.push(EvictionCandidate::Redis {
+                    key: e.key().clone(),
+                    last_accessed: last_accessed.load(Relaxed),
+                    size: value.len() as u64,
+                });
+                small_redis_memory += value.len() as u64;
+            }
+            RedisEntry::OnDisk {
+                size,
+                last_accessed,
+                ..
+            } => {
+                disk_candidates.push(EvictionCandidate::Redis {
+                    key: e.key().clone(),
+                    last_accessed: last_accessed.load(Relaxed),
+                    size: *size,
+                });
+                redis_disk += *size;
+            }
+        };
+    }
+
+    // Lets evict to 75% of each pool limit so we don't immediately re-trip the threshold on the very next insert.
+    let small_target = state.config.small_memory_limit() - state.config.small_memory_limit() / 4;
+    let memory_target = state.config.memory_limit.0 - state.config.memory_limit.0 / 4;
+    let disk_target = state.config.disk_limit.0 - state.config.disk_limit.0 / 4;
+
+    loop {
+        let drop_manifest_digest = if small_blob_memory + small_redis_memory + manifest_memory
+            > small_target
+            && let Some(candidate) = small_memory_candidates.pop()
+        {
+            match candidate {
+                EvictionCandidate::Manifest { digest, .. } => digest,
+                EvictionCandidate::Redis { key, size, .. } => {
+                    if state.remove_redis(&key) {
+                        small_redis_memory = small_redis_memory.saturating_sub(size);
+                        state.metrics.eviction_redis_entries.fetch_add(1, Relaxed);
+                    }
+                    continue;
+                }
+            }
+        } else if large_blob_memory
+            + large_redis_memory
+            + manifest_memory
+            + small_blob_memory
+            + small_redis_memory
+            > memory_target
+            && let Some(candidate) = large_memory_candidates.pop()
+        {
+            match candidate {
+                EvictionCandidate::Manifest {
+                    last_accesses,
+                    digest,
+                } => {
+                    let Some(mb) = state.manifests.get(&digest) else {
+                        continue;
+                    };
+                    let old = mb.evicted.swap(true, Relaxed);
+                    for r in referenced_digests(&mb.content) {
+                        let Some(bb) = blobs.get_mut(&r) else {
+                            continue;
+                        };
+                        if !old {
+                            // This manifest has not yet been evicted, so this blob's unevicted_refs is still accurate and must be decremented.
+                            bb.unevicted_refs = bb.unevicted_refs.saturating_sub(1);
+                        }
+                        // Only spill blobs that are exclusively reachable
+                        // from already-evicted manifests, and only the
+                        // large in-memory ones (small blobs would just
+                        // produce wasteful tiny files; on-disk ones are
+                        // already where we want them). The grace window
+                        // does not apply here: spilling preserves the
+                        // bytes, it just moves them to disk.
+                        if bb.unevicted_refs != 0 || bb.tier != BlobTier::LargeMem {
+                            continue;
+                        }
+                        let Some(blob) = state.blobs.get(&r).map(|e| e.value().clone()) else {
+                            continue;
+                        };
+                        let Blob::InMemory {
+                            content,
+                            media_type,
+                            id,
+                            last_accessed,
+                        } = blob.as_ref()
+                        else {
+                            continue;
+                        };
+
+                        let size = content.len() as u64;
+                        if let Err(e) = write_blob_to_disk(state, *id, content).await {
+                            warn!(digest=%r, error=%e, "failed to write blob to disk; keeping in memory");
+                            // Roll back the mem_mfst_refs decrement so future spill
+                            // attempts can retry.
+                            if !old {
+                                bb.unevicted_refs = bb.unevicted_refs.saturating_add(1);
+                            }
+                            continue;
+                        }
+                        let on_disk = Arc::new(Blob::OnDisk {
+                            size,
+                            media_type: media_type.clone(),
+                            last_accessed: AtomicU64::new(last_accessed.load(Relaxed)),
+                            id: *id,
+                        });
+                        state.insert_blob(r.clone(), on_disk);
+                        state.metrics.eviction_blobs_to_disk.fetch_add(1, Relaxed);
+                        large_blob_memory = large_blob_memory.saturating_sub(size);
+                        blob_disk = blob_disk.saturating_add(size);
+                    }
+                    // The manifest can now possible be evicted from disk
+                    disk_candidates.push(EvictionCandidate::Manifest {
+                        last_accesses,
+                        digest,
+                    });
+                }
+                EvictionCandidate::Redis { key, size, .. } => {
+                    if state.remove_redis(&key) {
+                        large_redis_memory = large_redis_memory.saturating_sub(size);
+                        state.metrics.eviction_redis_entries.fetch_add(1, Relaxed);
+                    }
+                }
+            }
+            continue;
+        } else if blob_disk + redis_disk > disk_target
+            && let Some(candidate) = disk_candidates.pop()
+        {
+            match candidate {
+                EvictionCandidate::Manifest { digest, .. } => digest,
+                EvictionCandidate::Redis { key, size, .. } => {
+                    if state.remove_redis(&key) {
+                        redis_disk = redis_disk.saturating_sub(size);
+                        state.metrics.eviction_redis_entries.fetch_add(1, Relaxed);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            // There is nothing left to evict
+            break;
+        };
+
+        // Drop the manifest, cascading to any blob whose last referrer it
+        // was. We go through `state.remove_manifest`/`state.remove_blob`
+        // so the seven incremental buckets on `State` stay in sync; the
+        // local accumulators above are only used to drive the loop's
+        // over-target checks.
+        let Some(manifest) = state.remove_manifest(&drop_manifest_digest) else {
+            continue;
+        };
+        state
+            .metrics
+            .eviction_manifests_deleted
+            .fetch_add(1, Relaxed);
+        manifest_memory = manifest_memory.saturating_sub(manifest.content.len() as u64);
+        state.tags.retain(|_, d| d != &drop_manifest_digest);
+        let old = manifest.evicted.swap(true, Relaxed);
+        for r in referenced_digests(&manifest.content) {
+            let Some(bb) = blobs.get_mut(&r) else {
+                continue;
+            };
+            if !old {
+                // This manifest has not yet been evicted, so this blob's unevicted_refs is still accurate and must be decremented.
+                bb.unevicted_refs = bb.unevicted_refs.saturating_sub(1);
+            }
+            bb.refs = bb.refs.saturating_sub(1);
+            if bb.refs != 0 || bb.last_accessed > now.saturating_sub(BLOB_GRACE_SECONDS) {
+                continue;
+            }
+            let Some(blob) = state.remove_blob(&r) else {
+                continue;
+            };
             state.metrics.eviction_blobs_deleted.fetch_add(1, Relaxed);
-            warn!("blob {} has zero refs but still in cache; removing", digest);
-            match b.as_ref() {
+            match blob.as_ref() {
                 Blob::InMemory { content, .. } => {
-                    let bytes = content.len() as u64;
-                    if *in_memory {
-                        memory_usage = memory_usage.saturating_sub(bytes);
+                    if content.len() > MEMORY_TIER_THRESHOLD {
+                        large_blob_memory = large_blob_memory.saturating_sub(content.len() as u64);
                     } else {
-                        disk_usage = disk_usage.saturating_sub(bytes);
+                        small_blob_memory = small_blob_memory.saturating_sub(content.len() as u64);
                     }
                 }
                 Blob::OnDisk { size, id, .. } => {
-                    disk_usage = disk_usage.saturating_sub(*size);
+                    blob_disk = blob_disk.saturating_sub(*size);
                     delete_disk_blob(state, *id).await;
                 }
             }
         }
     }
 
-    state.approx_memory_usage.store(memory_usage, Relaxed);
-    state.disk_usage.store(disk_usage, Relaxed);
+    // Unreferenced sweep. Picks up blobs that lost all refs without
+    // being directly dropped - the typical case is a freshly-uploaded
+    // blob whose only manifest was inside the grace window when it got
+    // dropped, so the cascade intentionally kept the blob behind.
+    for (digest, bb) in &blobs {
+        if bb.refs != 0 || now.saturating_sub(bb.last_accessed) < BLOB_GRACE_SECONDS {
+            continue;
+        }
+        if let Some(b) = state.remove_blob(digest) {
+            state.metrics.eviction_blobs_deleted.fetch_add(1, Relaxed);
+            warn!("blob {} has zero refs but still in cache; removing", digest);
+            if let Blob::OnDisk { id, .. } = b.as_ref() {
+                delete_disk_blob(state, *id).await;
+            }
+        }
+    }
 
-    // Snapshot the per-component breakdown and the oldest touch-times
-    // observed at the start of this pass onto the metrics. We don't try to
-    // keep these in sync with the evictions that happened in the loop
-    // above - same trade-off as `disk_usage`.
-    state
-        .metrics
-        .memory_usage_docker_bytes
-        .store(memory_docker_bytes, Relaxed);
-    state
-        .metrics
-        .memory_usage_redis_bytes
-        .store(memory_redis_bytes, Relaxed);
-    state
-        .metrics
-        .disk_usage_docker_bytes
-        .store(disk_docker_bytes, Relaxed);
-    state
-        .metrics
-        .disk_usage_redis_bytes
-        .store(disk_redis_bytes, Relaxed);
-    state.metrics.oldest_memory_touch_time.store(
-        if oldest_memory == u64::MAX {
-            0
-        } else {
-            oldest_memory
-        },
+    // The remaining candidates in each heap are still cached items the
+    // loop chose not to evict. Their oldest entry is, by construction,
+    // the oldest live item in that pool - publish it for observability.
+    state.metrics.oldest_small_memory_touch_time.store(
+        small_memory_candidates
+            .pop()
+            .map(|c| c.last_access_time())
+            .unwrap_or(now),
+        Relaxed,
+    );
+    state.metrics.oldest_large_memory_touch_time.store(
+        large_memory_candidates
+            .pop()
+            .map(|c| c.last_access_time())
+            .unwrap_or(now),
         Relaxed,
     );
     state.metrics.oldest_disk_touch_time.store(
-        if oldest_disk == u64::MAX {
-            0
-        } else {
-            oldest_disk
-        },
+        disk_candidates
+            .pop()
+            .map(|c| c.last_access_time())
+            .unwrap_or(now),
         Relaxed,
     );
 }
 
-/// Periodic eviction loop. Runs every 30s and triggers `evict` whenever
-/// in-memory usage exceeds the configured limit. Returns when `rt` is
+/// Periodic eviction loop. Wakes every 30s and triggers `evict` whenever
+/// any of the three pools is over its limit. Returns when `rt` is
 /// cancelled.
 pub async fn evict_loop(state: &'static State, rt: RunToken) -> Result<(), ()> {
-    use std::sync::atomic::Ordering::Relaxed;
     while cancelable(&rt, tokio::time::sleep(std::time::Duration::from_secs(30)))
         .await
         .is_ok()
     {
-        let limit = state.config.memory_limit.0;
-        let usage = state.approx_memory_usage.load(Relaxed);
-        if usage > limit {
-            debug!(usage, limit, "running eviction");
+        let small = state.small_memory_usage();
+        let total = state.total_memory_usage();
+        let disk = state.total_disk_usage();
+        let small_limit = state.config.small_memory_limit();
+        let memory_limit = state.config.memory_limit.0;
+        let disk_limit = state.config.disk_limit.0;
+        if small > small_limit as i64 || total > memory_limit as i64 || disk > disk_limit as i64 {
+            debug!(
+                small,
+                total, disk, small_limit, memory_limit, disk_limit, "running eviction"
+            );
             evict(state).await;
         }
     }
@@ -499,7 +541,7 @@ mod tests {
     //!     small-blob "delete in place, no file spill" path.
     use super::*;
     use crate::{
-        aligned_atomic::AlignedAtomicU64,
+        aligned_atomic::{AlignedAtomicI64, AlignedAtomicU64},
         config::Config,
         digest::Digest,
         metrics::Metrics,
@@ -515,7 +557,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             Arc,
-            atomic::{AtomicU64, Ordering::Relaxed},
+            atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
         },
     };
 
@@ -540,12 +582,24 @@ mod tests {
     /// Build a `&'static State` for tests, with no background time updater.
     /// `state.now` is initialised to [`NOW`] and never moves.
     fn make_state(memory_limit: u64, disk_limit: u64, label: &str) -> &'static State {
+        make_state_full(memory_limit, None, disk_limit, label)
+    }
+
+    /// Like [`make_state`] but lets the test override `small_memory_limit`
+    /// directly (rather than the default of `memory_limit / 8`).
+    fn make_state_full(
+        memory_limit: u64,
+        small_memory_limit: Option<u64>,
+        disk_limit: u64,
+        label: &str,
+    ) -> &'static State {
         let data_folder = temp_data_folder(label);
         let config = Config {
             https_port: None,
             http_port: None,
             data_folder: data_folder.to_string_lossy().into_owned(),
             memory_limit: Size(memory_limit),
+            small_memory_limit: small_memory_limit.map(Size),
             disk_limit: Size(disk_limit),
             docker_user: Vec::new(),
             docker_registry: HashMap::new(),
@@ -561,8 +615,13 @@ mod tests {
             config,
             reqwest_client: reqwest::Client::new(),
             now: AlignedAtomicU64::new(NOW),
-            approx_memory_usage: AlignedAtomicU64::new(0),
-            disk_usage: AlignedAtomicU64::new(0),
+            manifest_memory_usage: AlignedAtomicI64::new(0),
+            small_blob_memory_usage: AlignedAtomicI64::new(0),
+            large_blob_memory_usage: AlignedAtomicI64::new(0),
+            small_redis_memory_usage: AlignedAtomicI64::new(0),
+            large_redis_memory_usage: AlignedAtomicI64::new(0),
+            blob_disk_usage: AlignedAtomicI64::new(0),
+            redis_disk_usage: AlignedAtomicI64::new(0),
             redis_entries: DashMap::new(),
             metrics: Metrics::default(),
             next_id: AlignedAtomicU64::new(0),
@@ -597,8 +656,7 @@ mod tests {
             .await
             .unwrap();
         tokio::fs::write(&path, &content).await.unwrap();
-        state.disk_usage.fetch_add(content.len() as u64, Relaxed);
-        state.blobs.insert(
+        state.insert_blob(
             d.clone(),
             Arc::new(Blob::OnDisk {
                 id,
@@ -643,6 +701,7 @@ mod tests {
                 content,
                 media_type: "application/vnd.docker.distribution.manifest.v2+json".into(),
                 last_used: AtomicU64::new(last_used),
+                evicted: AtomicBool::new(false),
             }),
         );
         d
@@ -746,12 +805,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redis_small_entries_evicted_via_disk_path() {
-        // Small values (<= SNAPSHOT_INLINE_THRESHOLD) are virtually-on-disk;
-        // they age out through the disk-budget path, not the memory one.
+    async fn redis_small_entries_evicted_under_small_pool_pressure() {
+        // Small values (<= MEMORY_TIER_THRESHOLD) are charged to the
+        // in-memory small pool. They age out when the small pool
+        // overruns; they are never written to disk.
         let small = vec![b'y'; 32];
         let entry_size = (small.len() + b"k_old".len()) as u64;
-        let state = make_state(1024 * 1024 * 1024, entry_size * 4, "redis-small");
+        let state = make_state_full(
+            1024 * 1024 * 1024,
+            Some(entry_size * 3),
+            1024 * 1024 * 1024,
+            "redis-small",
+        );
         insert_redis(state, b"k_old", &small, OLD);
         insert_redis(state, b"k_med", &small, OLD + 1);
         insert_redis(state, b"k_new", &small, OLD + 2);
@@ -897,10 +962,11 @@ mod tests {
     #[tokio::test]
     async fn small_in_memory_blob_not_spilled_but_deleted_in_place() {
         // Below the inline threshold the eviction code must NOT write the
-        // blob out as a tiny file; instead it accounts against the disk
-        // budget and deletes the blob from RAM when its manifest ages out.
-        let state = make_state(1024 * 1024 * 1024, 8, "tiny");
+        // blob out as a tiny file; instead it is reclaimed by dropping its
+        // manifest under small-pool pressure, and removed from RAM as
+        // part of the cascade.
         let blob_content = Bytes::from(vec![b'e'; 64]); // well below threshold
+        let state = make_state_full(1024 * 1024 * 1024, Some(64), 1024 * 1024 * 1024, "tiny");
         let blob_digest = insert_blob_in_memory(state, blob_content, OLD);
         let manifest_body = manifest_body(&[&blob_digest]);
         insert_manifest_(state, manifest_body, OLD);
@@ -909,7 +975,7 @@ mod tests {
 
         assert!(
             !state.blobs.contains_key(&blob_digest),
-            "small blob should be deleted alongside its disk-tier manifest"
+            "small blob should be deleted when its manifest is dropped"
         );
         assert!(
             list_blob_files(state).is_empty(),
