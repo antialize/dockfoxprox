@@ -261,6 +261,42 @@ async fn handle_request_inner(
     }
 }
 
+/// Every manifest media type we know how to cache and serve. Sent verbatim in
+/// the upstream `Accept` header for manifest requests.
+const MANIFEST_ACCEPT_TYPES: &[&str] = &[
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.docker.distribution.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v1+prettyjws",
+];
+
+/// Build the `Accept` header for an upstream manifest request: the full set of
+/// known manifest media types, followed by any additional types the client
+/// asked for that we don't already list. We never narrow to just the client's
+/// Accept, because registries like ghcr.io 404 a manifest whose media type is
+/// absent from Accept, and a pull-through cache can't assume the client
+/// advertised the type the tag actually resolves to.
+fn manifest_accept(client_accept: Option<&str>) -> String {
+    let mut out: Vec<String> = MANIFEST_ACCEPT_TYPES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Some(a) = client_accept {
+        for part in a.split(',') {
+            let t = part.split(';').next().unwrap_or("").trim();
+            if t.is_empty() || t == "*/*" {
+                continue;
+            }
+            if !out.iter().any(|e| e.eq_ignore_ascii_case(t)) {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out.join(", ")
+}
+
 /// GET/HEAD a manifest, serving from cache when possible. For a tag
 /// reference we always HEAD upstream first to learn the current digest, so
 /// `latest` and friends track the source registry. For a digest reference we
@@ -275,13 +311,18 @@ async fn get_head_manifest(
 ) -> Result<Response<ProxyBody>, DockerError> {
     use std::sync::atomic::Ordering;
 
-    // Forward the client's Accept header so the registry returns the manifest
-    // flavor the client actually understands (OCI index vs docker v2, etc).
-    let accept = req
+    // Build the Accept header sent upstream. We always advertise every known
+    // manifest media type (plus whatever extra the client asked for), because
+    // some registries - notably ghcr.io - return 404 for a manifest whose
+    // media type isn't listed in Accept. A pull-through cache must not depend
+    // on the client advertising the right type: e.g. an image published only
+    // as an OCI image index is invisible unless we ask for
+    // `application/vnd.oci.image.index.v1+json` explicitly.
+    let client_accept = req
         .headers()
         .get(hyper::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .and_then(|v| v.to_str().ok());
+    let accept = Some(manifest_accept(client_accept));
 
     // Resolve `<reference>` to a content digest. If the client already gave us
     // a digest we trust it; otherwise it's a tag and we HEAD upstream to learn
